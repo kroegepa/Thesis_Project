@@ -1,0 +1,10 @@
+Possible MPE Environments to try
+1. Simple adversary
+2. Simple spread
+3. Simple tag
+4. Simple World Comm
+5. Multiwalker
+6. Pursuit (Needs to be implemented - quick)
+
+I like the last two, how many?
+Also SC2 after if works.
