@@ -4,7 +4,9 @@ Possible MPE Environments to try
 3. Simple tag
 4. Simple World Comm
 5. Multiwalker
-6. Pursuit (Needs to be implemented - quick)
+6. Pursuit (Needs to be implemented) Done
 
 I like the last two, how many?
 Also SC2 after if works.
+
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
