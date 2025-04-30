@@ -16,7 +16,7 @@ obs_range : 7
 # number of pursuers needed to catch an evader
 n_catch : 2
 # toggle for evaders to be unable to move
-freeze_evaders : true
+freeze_evaders : True
 # reward for tagging/touching an evader
 tag_reward : 0.01
 # reward for catching an evader
