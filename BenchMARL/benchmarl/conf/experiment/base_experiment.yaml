@@ -97,7 +97,7 @@ evaluation_episodes: 10
 evaluation_deterministic_actions: True
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
 # If False, evaluation environments will be more random throughout training
-evaluation_static: False
+evaluation_static: True
 
 # List of loggers to use, options are: wandb, csv, tensorboard, mflow
 loggers: [csv,wandb]
