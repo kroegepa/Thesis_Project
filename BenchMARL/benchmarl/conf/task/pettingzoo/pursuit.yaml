@@ -16,15 +16,15 @@ obs_range : 7
 # number of pursuers needed to catch an evader
 n_catch : 2
 # toggle for evaders to be unable to move
-freeze_evaders : True
+freeze_evaders : False
 # reward for tagging/touching an evader
-tag_reward : 0.01
+tag_reward : 0.02
 # reward for catching an evader
-catch_reward : 5.0
+catch_reward : 10.0
 # reward to encourage catching evaders quickly
-urgency_reward : -0.1
+urgency_reward : -0.2
 # toggle whether evader is removed when surrounded, or when n_catch pursuers are on top of evader
-surround : False
+surround : True
 # Size of box which agents can randomly spawn into environment world (seen from center). 1 is entire map, 0 is center only
 constraint_window : 1.0
 # whether reward is distributed among all agents or allocated individually
