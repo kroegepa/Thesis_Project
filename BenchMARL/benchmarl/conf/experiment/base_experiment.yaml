@@ -94,7 +94,7 @@ evaluation_interval: 120_000
 # Number of episodes that evaluation is run on
 evaluation_episodes: 10
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
-evaluation_deterministic_actions: True
+evaluation_deterministic_actions: False
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
 # If False, evaluation environments will be more random throughout training
 evaluation_static: False
