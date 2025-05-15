@@ -80,6 +80,10 @@ class ExperimentConfig:
     polyak_tau: float = MISSING
     hard_target_update_frequency: int = MISSING
 
+    reward_perturbation: bool = MISSING
+    reward_perturbation_type: str = MISSING
+    reward_perturbation_stdev: float = MISSING
+
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
     exploration_anneal_frames: Optional[int] = MISSING
@@ -658,6 +662,25 @@ class Experiment(CallbackNotifier):
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
 
+    def _apply_reward_perturbation(self, batch, perturbation_type, stdev):
+        if perturbation_type == "normal":
+            for group in self.group_map.keys():
+                reward = batch.get(group).get("episode_reward")
+                reward_step = torch.zeros_like(reward)
+                reward_step = reward[:,1:] - reward[:,:-1]
+                noise = torch.randn_like(reward_step) * stdev
+                reward_step = reward_step + noise
+                batch.get(group).set("episode_reward", torch.cumsum(reward_step,dim=1))
+        #Under construction
+        elif perturbation_type == "uniform":
+            batch.get("next").get("pursuer").set("reward", torch.zeros_like(batch.get("next").get("pursuer").get("reward")))
+            batch.get("next").get("pursuer").set("episode_reward", torch.zeros_like(batch.get("next").get("pursuer").get("episode_reward")))
+            for group in self.group_map.keys():
+                batch.get(group).set("episode_reward", torch.zeros_like(batch.get(group).get("episode_reward")))
+        else:
+            raise ValueError(f"Unknown perturbation type: {perturbation_type}")
+        return batch
+
     def _collection_loop(self):
         pbar = tqdm(
             initial=self.n_iters_performed,
@@ -694,7 +717,12 @@ class Experiment(CallbackNotifier):
                         action_keys=self.rollout_env.action_keys,
                         done_keys=self.rollout_env.done_keys,
                     )
-
+            if self.config.reward_perturbation:
+                batch = self._apply_reward_perturbation(
+                    batch,
+                    self.config.reward_perturbation_type,
+                    self.config.reward_perturbation_stdev,
+                )
             # Logging collection
             collection_time = time.time() - iteration_start
             current_frames = batch.numel()
