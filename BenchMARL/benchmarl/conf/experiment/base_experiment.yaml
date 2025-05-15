@@ -59,7 +59,7 @@ max_n_iters: null
 max_n_frames: 6_000_000
 
 # Number of frames collected and each experiment iteration
-on_policy_collected_frames_per_batch: 3000
+on_policy_collected_frames_per_batch: 6000
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.

@@ -664,13 +664,31 @@ class Experiment(CallbackNotifier):
 
     def _apply_reward_perturbation(self, batch, perturbation_type, stdev):
         if perturbation_type == "normal":
+            done = batch.get("done")
             for group in self.group_map.keys():
-                reward = batch.get(group).get("episode_reward")
-                reward_step = torch.zeros_like(reward)
-                reward_step = reward[:,1:] - reward[:,:-1]
-                noise = torch.randn_like(reward_step) * stdev
-                reward_step = reward_step + noise
-                batch.get(group).set("episode_reward", torch.cumsum(reward_step,dim=1))
+                # 1. Get the actual reward from `next`  
+                reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
+
+                # 2. Add Gaussian noise to per-step rewards
+                noise = torch.randn_like(reward) * stdev
+                reward_noisy = reward + noise
+
+                # 3. Set the modified reward back in the batch
+                batch.get("next").get(group).set("reward", reward_noisy)
+
+                # 4. Recompute cumulative episode_reward with reset at done
+                episode_reward = torch.zeros_like(reward_noisy)
+                cumulative = torch.zeros_like(reward_noisy[:, 0])  # [B, A, 1]
+                done_broadcast = done.unsqueeze(2).expand(-1, -1, reward.shape[2], -1)                
+                for t in range(reward_noisy.shape[1]):
+                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_noisy[:, t]
+                    episode_reward[:, t] = cumulative
+                    
+
+                # 5. Store recomputed episode_reward
+                batch.get("next").get(group).set("episode_reward", episode_reward)
+                batch.get(group).set("episode_reward", episode_reward)
+
         #Under construction
         elif perturbation_type == "uniform":
             batch.get("next").get("pursuer").set("reward", torch.zeros_like(batch.get("next").get("pursuer").get("reward")))
