@@ -83,7 +83,9 @@ class ExperimentConfig:
     reward_perturbation: bool = MISSING
     reward_perturbation_type: str = MISSING
     reward_perturbation_stdev: float = MISSING
+    reward_perturbation_flip_prob: float = MISSING
 
+    pof_enable: bool = MISSING
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
     exploration_anneal_frames: Optional[int] = MISSING
@@ -662,7 +664,10 @@ class Experiment(CallbackNotifier):
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
 
-    def _apply_reward_perturbation(self, batch, perturbation_type, stdev):
+    def _pof_transform(self, batch, task_name):
+        return batch
+
+    def _apply_reward_perturbation(self, batch, perturbation_type, stdev, flip_prob):
         if perturbation_type == "normal":
             done = batch.get("done")
             for group in self.group_map.keys():
@@ -683,9 +688,40 @@ class Experiment(CallbackNotifier):
                 for t in range(reward_noisy.shape[1]):
                     cumulative = cumulative * (~done_broadcast[:, t]) + reward_noisy[:, t]
                     episode_reward[:, t] = cumulative
+            
+                
                     
 
                 # 5. Store recomputed episode_reward
+                batch.get("next").get(group).set("episode_reward", episode_reward)
+                batch.get(group).set("episode_reward", episode_reward)
+
+        elif perturbation_type == "bernoulli":
+            done = batch.get("done")
+            for group in self.group_map.keys():
+                # 1. Get the reward
+                reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
+
+                # 2. Create a mask of ±1 based on flip probability
+                flip_mask = torch.bernoulli(torch.full_like(reward, flip_prob))
+                flip_mask = 1.0 - 2.0 * flip_mask  # 0 -> +1, 1 -> -1
+
+                # 3. Apply flipping
+                reward_flipped = reward * flip_mask
+
+                # 4. Set flipped reward back
+                batch.get("next").get(group).set("reward", reward_flipped)
+
+                # 5. Recompute episode_reward
+                episode_reward = torch.zeros_like(reward_flipped)
+                cumulative = torch.zeros_like(reward_flipped[:, 0])  # [B, A, 1]
+                done_broadcast = done.unsqueeze(2).expand(-1, -1, reward.shape[2], -1)
+
+                for t in range(reward_flipped.shape[1]):
+                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_flipped[:, t]
+                    episode_reward[:, t] = cumulative
+
+                # 6. Store recomputed episode_reward
                 batch.get("next").get(group).set("episode_reward", episode_reward)
                 batch.get(group).set("episode_reward", episode_reward)
 
@@ -740,7 +776,12 @@ class Experiment(CallbackNotifier):
                     batch,
                     self.config.reward_perturbation_type,
                     self.config.reward_perturbation_stdev,
+                    self.config.reward_perturbation_flip_prob
                 )
+            
+            if self.config.pof_enable:
+                batch = self._pof_transform(batch, self.task_name)
+            
             # Logging collection
             collection_time = time.time() - iteration_start
             current_frames = batch.numel()

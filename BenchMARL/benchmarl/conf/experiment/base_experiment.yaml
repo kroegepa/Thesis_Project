@@ -40,10 +40,15 @@ hard_target_update_frequency: 5
 
 # Wheter to include reward attack
 reward_perturbation: True
-# The reward attack type, options are: "gaussian", "benoulli"
-reward_perturbation_type: "normal"
+# The reward attack type, options are: "gaussian", "bernoulli"
+reward_perturbation_type: "bernoulli"
 # The reward attack standard deviation, relevant for gaussian
 reward_perturbation_stdev: 0.5
+# The reward flip probability, relevant for bernoulli
+reward_perturbation_flip_prob: 0.1
+
+#Whether to include power of friendship(pfo) reward robustness mechanism
+pof_enable: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
