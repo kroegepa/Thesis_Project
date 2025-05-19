@@ -36,11 +36,12 @@ def pursuit_grouping(batch):
 
    # reward: [B, T, A, 1]
     new_reward = reward.clone()
+    device = reward.device
 
     # Loop over groups 0, 1, 2
     for g in range(3):
         # Create mask for group g: shape [B, T, A, 1]
-        group_mask = (grouping_tensor[..., g] == 1).unsqueeze(-1).float()
+        group_mask = (grouping_tensor[..., g] == 1).unsqueeze(-1).float().to(device)  # shape: [B, T, A, 1]
 
         # Compute sum and count for averaging
         group_sum = (reward * group_mask).sum(dim=2, keepdim=True)  # sum over agents
