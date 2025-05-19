@@ -14,7 +14,7 @@ y_size : 16
 # observation range of pursuers
 obs_range : 7
 # number of pursuers needed to catch an evader
-n_catch : 2
+n_catch : 3
 # toggle for evaders to be unable to move
 freeze_evaders : False
 # reward for tagging/touching an evader

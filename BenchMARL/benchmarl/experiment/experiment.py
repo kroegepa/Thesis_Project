@@ -32,7 +32,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-
+from benchmarl.pof_methods.pof_methods import pof_transform
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -664,9 +664,6 @@ class Experiment(CallbackNotifier):
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
 
-    def _pof_transform(self, batch, task_name):
-        return batch
-
     def _apply_reward_perturbation(self, batch, perturbation_type, stdev, flip_prob):
         if perturbation_type == "normal":
             done = batch.get("done")
@@ -780,7 +777,7 @@ class Experiment(CallbackNotifier):
                 )
             
             if self.config.pof_enable:
-                batch = self._pof_transform(batch, self.task_name)
+                batch = pof_transform(batch, self.task_name)
             
             # Logging collection
             collection_time = time.time() - iteration_start
