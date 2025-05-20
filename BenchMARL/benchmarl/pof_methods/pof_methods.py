@@ -12,7 +12,9 @@ def pof_transform(batch, task_name):
     
     batch = pursuit_grouping(batch)
     return batch
-
+def calc_agent_position(observation_size):
+    #I think this is only right for uneven observation sizes
+    return (observation_size // 2) + 1
 def pursuit_grouping(batch):
     # Placeholder: determine which agents are near an evader based on obs and action
     #Batch Time and agent dimension
@@ -23,13 +25,15 @@ def pursuit_grouping(batch):
     #Just time dimension
     #max_group_vector = torch.zeros(reward.shape[1])
     #Use batch size from batch object here instead?
+    agent_position = calc_agent_position(obs.shape[3])
     for b in range(reward.shape[0]):
-        for t in range(reward.shape[1]-1):
+        for t in range(reward.shape[1]):
             for a in range(reward.shape[2]):
-                #Eww
-                if abs(reward[b,t,a,0]) > 3:
+
+
+                if abs(reward[b,t,a,:]) > 3 or catching(obs[b,t,a,:],agent_position,agent_position):
                     grouping_tensor[b,t,a,2] = 1
-                elif touching_distance(obs[b,t+1,a,:]):
+                elif touching_distance(obs[b,t,a,:],agent_position,agent_position):
                     grouping_tensor[b,t,a,1] = 1
                 else:
                     grouping_tensor[b,t,a,0] = 1
@@ -56,12 +60,24 @@ def pursuit_grouping(batch):
     batch["next"]["pursuer"]["reward"] = new_reward
     return batch
 
-def touching_distance(observation):
+def touching_distance(observation,x,y):
     #Hardcoded for obs size = 7 for now
-    if (observation[3,4,2] == 1 or 
-    observation[5,4,2] == 1 or 
-    observation[4,3,2] == 1 or
-    observation[4,5,2] == 1):
-        return True
-    else:
-        return False    
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (0,0)]:
+        nx, ny = x + dx, y + dy
+        #TODO Size constraint observation
+        if observation[nx, ny, 2] == 1:  # Check evader channel
+            return True
+    return False    
+
+def catching(observation, x, y):
+    #Under Construction
+    return False
+    #sth like this
+    surrounding_count = 0
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < observation.shape[0] and 0 <= ny < observation.shape[1]:
+            if observation[nx, ny, 1] == 1:  # Check pursuer channel (fixed)
+                surrounding_count += 1
+
+    return surrounding_count >= 3
