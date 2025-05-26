@@ -1,4 +1,3 @@
-#Naming???
 import torch
 def pof_transform(batch, task_name):
     #Add supported tasks here
@@ -7,7 +6,7 @@ def pof_transform(batch, task_name):
     ):
         raise NotImplementedError(f"Task {task_name} not supported for POF transform.")
     
-    #Will make this part of the task object!
+    #Should make this part of the task object!
 
     
     batch = pursuit_grouping(batch)
@@ -25,25 +24,37 @@ def pursuit_grouping(batch):
     #Just time dimension
     #max_group_vector = torch.zeros(reward.shape[1])
     #Use batch size from batch object here instead?
+
+    #Perfect grouping by reward signal
+    for b in range(reward.shape[0]):
+        for t in range(reward.shape[1]):
+            for a in range(reward.shape[2]):
+                if abs(reward[b,t,a,0]) > 2:  # Threshold for grouping
+                    grouping_tensor[b,t,a,2] = 1
+                elif abs(reward[b,t,a,0]) >= -0.9:  # Threshold for grouping
+                    grouping_tensor[b,t,a,1] = 1
+                else:
+                    grouping_tensor[b,t,a,0] = 1
+    return grouping_tensor
+    #Simple Heuristic
     agent_position = calc_agent_position(obs.shape[3])
     for b in range(reward.shape[0]):
         for t in range(reward.shape[1]):
             for a in range(reward.shape[2]):
-
-
-                if abs(reward[b,t,a,:]) > 3 or catching(obs[b,t,a,:],agent_position,agent_position):
-                    grouping_tensor[b,t,a,2] = 1
-                elif touching_distance(obs[b,t,a,:],agent_position,agent_position):
+                if touching_distance(obs[b,t,a,:],agent_position,agent_position):
                     grouping_tensor[b,t,a,1] = 1
                 else:
                     grouping_tensor[b,t,a,0] = 1
 
-   # reward: [B, T, A, 1]
+    return grouping_tensor
+
+
+def grouping_reward_averaging(batch, grouping_tensor):
+    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
+    # Loop over groups 0, 1, 2
     new_reward = reward.clone()
     device = reward.device
-
-    # Loop over groups 0, 1, 2
-    for g in range(3):
+    for g in range(grouping_tensor.shape[-1]):
         # Create mask for group g: shape [B, T, A, 1]
         group_mask = (grouping_tensor[..., g] == 1).unsqueeze(-1).float().to(device)  # shape: [B, T, A, 1]
 
@@ -69,6 +80,7 @@ def touching_distance(observation,x,y):
             return True
     return False    
 
+#Doesnt matter
 def catching(observation, x, y):
     #Under Construction
     return False

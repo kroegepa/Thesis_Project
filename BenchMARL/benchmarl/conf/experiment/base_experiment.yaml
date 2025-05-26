@@ -48,7 +48,7 @@ reward_perturbation_stdev: 0.5
 reward_perturbation_flip_prob: 0.1
 
 #Whether to include power of friendship(pfo) reward robustness mechanism
-pof_enable: True
+pof_enable: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8

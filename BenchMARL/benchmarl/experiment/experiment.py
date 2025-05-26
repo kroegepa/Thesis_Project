@@ -32,7 +32,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import pof_transform
+from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -737,7 +737,6 @@ class Experiment(CallbackNotifier):
             initial=self.n_iters_performed,
             total=self.config.get_max_n_iters(self.on_policy),
         )
-
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
@@ -768,6 +767,8 @@ class Experiment(CallbackNotifier):
                         action_keys=self.rollout_env.action_keys,
                         done_keys=self.rollout_env.done_keys,
                     )
+            grouping_tensor = pursuit_grouping(batch)
+
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(
                     batch,
@@ -777,7 +778,7 @@ class Experiment(CallbackNotifier):
                 )
             
             if self.config.pof_enable:
-                batch = pof_transform(batch, self.task_name)
+                batch = grouping_reward_averaging(batch, grouping_tensor)
             
             # Logging collection
             collection_time = time.time() - iteration_start
