@@ -63,6 +63,8 @@ max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
 max_n_frames: 6_000_000
 
+warmup_iters: 1
+
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 6000
 # Number of environments used for collection

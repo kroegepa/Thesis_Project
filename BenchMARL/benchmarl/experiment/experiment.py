@@ -24,6 +24,10 @@ import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
 from torchrl.collectors import SyncDataCollector
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
 from torchrl.envs.transforms import Compose
@@ -32,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging
+from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, GroupingCNN
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -92,6 +96,8 @@ class ExperimentConfig:
 
     max_n_iters: Optional[int] = MISSING
     max_n_frames: Optional[int] = MISSING
+
+    warmup_iters: int = MISSING
 
     on_policy_collected_frames_per_batch: int = MISSING
     on_policy_n_envs_per_worker: int = MISSING
@@ -663,6 +669,58 @@ class Experiment(CallbackNotifier):
             f"Evaluation results logged to loggers={self.config.loggers}"
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
+    def train_grouping_model_from_warmup(self, warmup_batches):
+        obs_list, act_list, label_list = [], [], []
+
+        for batch in warmup_batches:
+            obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
+            act = batch["pursuer"]["action"]       # [B, T, A, act_dim]
+            reward = batch["next"]["pursuer"]["reward"]  # [B, T, A, 1]
+            act_dim = 5
+            group = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
+            for b in range(reward.shape[0]):
+                for t in range(reward.shape[1]):
+                    for a in range(reward.shape[2]):
+                        r = reward[b, t, a, 0]
+                        if abs(r) > 2:
+                            group[b, t, a, 2] = 1
+                        elif abs(r) >= -0.9:
+                            group[b, t, a, 1] = 1
+                        else:
+                            group[b, t, a, 0] = 1
+
+            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+            act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim)  # [B, T, A, act_dim]
+            act_list.append(act_onehot.reshape(-1, act_dim))            
+            obs_list.append(obs.reshape(-1, 3, 7, 7))
+            label_list.append(group.argmax(dim=-1).view(-1))
+
+        obs_tensor = torch.cat(obs_list, dim=0)
+        act_tensor = torch.cat(act_list, dim=0)
+        label_tensor = torch.cat(label_list, dim=0)
+        device = obs_tensor.device
+        self.grouping_model = GroupingCNN(act_tensor.shape[-1]).to(device)
+
+        dataset = TensorDataset(obs_tensor, act_tensor, label_tensor)
+        dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
+
+        optimizer = torch.optim.Adam(self.grouping_model.parameters(), lr=1e-3)
+        criterion = nn.CrossEntropyLoss()
+
+        self.grouping_model.train()
+        for epoch in range(35):
+            total_loss = 0
+            for obs_b, act_b, label_b in dataloader:
+                obs_b = obs_b.to(device)
+                act_b = act_b.to(device)
+                label_b = label_b.to(device)
+
+                optimizer.zero_grad()
+                logits = self.grouping_model(obs_b, act_b)
+                loss = criterion(logits, label_b)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
 
     def _apply_reward_perturbation(self, batch, perturbation_type, stdev, flip_prob):
         if perturbation_type == "normal":
@@ -687,8 +745,6 @@ class Experiment(CallbackNotifier):
                     episode_reward[:, t] = cumulative
             
                 
-                    
-
                 # 5. Store recomputed episode_reward
                 batch.get("next").get(group).set("episode_reward", episode_reward)
                 batch.get(group).set("episode_reward", episode_reward)
@@ -731,22 +787,52 @@ class Experiment(CallbackNotifier):
         else:
             raise ValueError(f"Unknown perturbation type: {perturbation_type}")
         return batch
+    
+
+        # Warm-up loop and main training loop separated
+
+    def predict(self, batch):
+        obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
+        act = batch["pursuer"]["action"]       # [B, T, A]  (discrete)
+
+        # Reshape correctly
+        B, T, A = obs.shape[:3]
+        obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+        obs = obs.reshape(-1, 3, 7, 7)  # [B*T*A, C, H, W]
+        # One-hot encode actions
+        act_dim = 5
+        act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
+
+        # Run model
+        with torch.no_grad():
+            logits = self.grouping_model(obs, act)  # [B*T*A, 3]
+            group_idx = logits.argmax(dim=-1).view(B, T, A)
+            return F.one_hot(group_idx, num_classes=3).float()  # [B, T, A, 3]
+
+
+        with torch.no_grad():
+            logits = self.grouping_model(obs.view(-1, obs.shape[-1]), act.view(-1, act.shape[-1]))
+            group_idx = logits.argmax(dim=-1).view(B, T, A)
+            # Convert to one-hot tensor of shape [B, T, A, 3]
+            return F.one_hot(group_idx, num_classes=3).float()
+
 
     def _collection_loop(self):
         pbar = tqdm(
             initial=self.n_iters_performed,
             total=self.config.get_max_n_iters(self.on_policy),
-        )
+         )
+
+        warmup_iters = self.config.warmup_iters
+        warmup_data = []
+
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
             reset_batch = self.rollout_env.reset()
 
-        # Training/collection iterations
-        for _ in range(
-            self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
-        ):
-            iteration_start = time.time()
+        # === Warm-up Phase ===
+        for warmup_step in range(warmup_iters):
             if not self.config.collect_with_grad:
                 batch = next(iterator)
             else:
@@ -766,8 +852,61 @@ class Experiment(CallbackNotifier):
                         reward_keys=self.rollout_env.reward_keys,
                         action_keys=self.rollout_env.action_keys,
                         done_keys=self.rollout_env.done_keys,
+                     )
+
+            warmup_data.append(batch.detach())
+
+            self._on_batch_collected(batch)
+            batch = batch.detach()
+            for group in self.train_group_map.keys():
+                group_batch = batch.exclude(*self._get_excluded_keys(group))
+                group_batch = self.algorithm.process_batch(group, group_batch)
+                if not self.algorithm.has_rnn:
+                    group_batch = group_batch.reshape(-1)
+                group_buffer = self.replay_buffers[group]
+                group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                    for _ in range(
+                        -(
+                            -self.config.train_batch_size(self.on_policy)
+                            // self.config.train_minibatch_size(self.on_policy)
+                        )
+                    ):
+                        self._optimizer_loop(group)
+
+        # Train grouping model after warm-up
+
+        self.train_grouping_model_from_warmup(warmup_data)
+
+        # Reset policy to prevent bleedover
+        self.policy = self.algorithm.get_policy_for_collection()
+
+        # === Main Training Phase ===
+        for _ in range(warmup_iters, self.config.get_max_n_iters(self.on_policy)):
+            iteration_start = time.time()
+
+            if not self.config.collect_with_grad:
+                batch = next(iterator)
+            else:
+                with set_exploration_type(ExplorationType.RANDOM):
+                    batch = self.rollout_env.rollout(
+                        max_steps=-(
+                            -self.config.collected_frames_per_batch(self.on_policy)
+                            // self.rollout_env.batch_size.numel()
+                        ),
+                        policy=self.policy,
+                        break_when_any_done=False,
+                        auto_reset=False,
+                        tensordict=reset_batch,
                     )
-            grouping_tensor = pursuit_grouping(batch)
+                    reset_batch = step_mdp(
+                        batch[..., -1],
+                        reward_keys=self.rollout_env.reward_keys,
+                        action_keys=self.rollout_env.action_keys,
+                        done_keys=self.rollout_env.done_keys,
+                     )
+
+            grouping_tensor = self.predict(batch)  # Group per timestep
 
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(
@@ -775,12 +914,11 @@ class Experiment(CallbackNotifier):
                     self.config.reward_perturbation_type,
                     self.config.reward_perturbation_stdev,
                     self.config.reward_perturbation_flip_prob
-                )
-            
+                 )
+
             if self.config.pof_enable:
                 batch = grouping_reward_averaging(batch, grouping_tensor)
-            
-            # Logging collection
+
             collection_time = time.time() - iteration_start
             current_frames = batch.numel()
             self.total_frames += current_frames
@@ -792,12 +930,9 @@ class Experiment(CallbackNotifier):
             )
             pbar.set_description(f"mean return = {self.mean_return}", refresh=False)
 
-            # Callback
             self._on_batch_collected(batch)
             batch = batch.detach()
 
-            # Loop over groups
-            training_start = time.time()
             for group in self.train_group_map.keys():
                 group_batch = batch.exclude(*self._get_excluded_keys(group))
                 group_batch = self.algorithm.process_batch(group, group_batch)
@@ -817,29 +952,21 @@ class Experiment(CallbackNotifier):
                     ):
                         training_tds.append(self._optimizer_loop(group))
                 training_td = torch.stack(training_tds)
-                self.logger.log_training(
-                    group, training_td, step=self.n_iters_performed
-                )
-
-                # Callback
+                self.logger.log_training(group, training_td, step=self.n_iters_performed)
                 self._on_train_end(training_td, group)
 
-                # Exploration update
                 if isinstance(self.group_policies[group], TensorDictSequential):
                     explore_layer = self.group_policies[group][-1]
                 else:
                     explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):  # Step exploration annealing
+                if hasattr(explore_layer, "step"):
                     explore_layer.step(current_frames)
 
-            # Update policy in collector
             if not self.config.collect_with_grad:
                 self.collector.update_policy_weights_()
 
-            # Training timer
-            training_time = time.time() - training_start
+            training_time = time.time() - iteration_start
 
-            # Evaluation
             if (
                 self.config.evaluation
                 and (
@@ -850,7 +977,6 @@ class Experiment(CallbackNotifier):
             ):
                 self._evaluation_loop()
 
-            # End of step
             iteration_time = time.time() - iteration_start
             self.total_time += iteration_time
             self.logger.log(
@@ -867,16 +993,163 @@ class Experiment(CallbackNotifier):
             )
             self.n_iters_performed += 1
             self.logger.commit()
+
             if (
                 self.config.checkpoint_interval > 0
                 and self.total_frames % self.config.checkpoint_interval == 0
             ):
                 self._save_experiment()
-            pbar.update()
 
         if self.config.checkpoint_at_end:
             self._save_experiment()
         self.close()
+
+
+    # def _collection_loop(self):
+    #     pbar = tqdm(
+    #         initial=self.n_iters_performed,
+    #         total=self.config.get_max_n_iters(self.on_policy),
+    #     )
+    #     if not self.config.collect_with_grad:
+    #         iterator = iter(self.collector)
+    #     else:
+    #         reset_batch = self.rollout_env.reset()
+
+    #     # Training/collection iterations
+    #     for _ in range(
+    #         self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
+    #     ):
+    #         iteration_start = time.time()
+    #         if not self.config.collect_with_grad:
+    #             batch = next(iterator)
+    #         else:
+    #             with set_exploration_type(ExplorationType.RANDOM):
+    #                 batch = self.rollout_env.rollout(
+    #                     max_steps=-(
+    #                         -self.config.collected_frames_per_batch(self.on_policy)
+    #                         // self.rollout_env.batch_size.numel()
+    #                     ),
+    #                     policy=self.policy,
+    #                     break_when_any_done=False,
+    #                     auto_reset=False,
+    #                     tensordict=reset_batch,
+    #                 )
+    #                 reset_batch = step_mdp(
+    #                     batch[..., -1],
+    #                     reward_keys=self.rollout_env.reward_keys,
+    #                     action_keys=self.rollout_env.action_keys,
+    #                     done_keys=self.rollout_env.done_keys,
+    #                 )
+    #         grouping_tensor = pursuit_grouping(batch)
+
+    #         if self.config.reward_perturbation:
+    #             batch = self._apply_reward_perturbation(
+    #                 batch,
+    #                 self.config.reward_perturbation_type,
+    #                 self.config.reward_perturbation_stdev,
+    #                 self.config.reward_perturbation_flip_prob
+    #             )
+            
+    #         if self.config.pof_enable:
+    #             batch = grouping_reward_averaging(batch, grouping_tensor)
+            
+    #         # Logging collection
+    #         collection_time = time.time() - iteration_start
+    #         current_frames = batch.numel()
+    #         self.total_frames += current_frames
+    #         self.mean_return = self.logger.log_collection(
+    #             batch,
+    #             total_frames=self.total_frames,
+    #             task=self.task,
+    #             step=self.n_iters_performed,
+    #         )
+    #         pbar.set_description(f"mean return = {self.mean_return}", refresh=False)
+
+    #         # Callback
+    #         self._on_batch_collected(batch)
+    #         batch = batch.detach()
+
+    #         # Loop over groups
+    #         training_start = time.time()
+    #         for group in self.train_group_map.keys():
+    #             group_batch = batch.exclude(*self._get_excluded_keys(group))
+    #             group_batch = self.algorithm.process_batch(group, group_batch)
+    #             if not self.algorithm.has_rnn:
+    #                 group_batch = group_batch.reshape(-1)
+
+    #             group_buffer = self.replay_buffers[group]
+    #             group_buffer.extend(group_batch.to(group_buffer.storage.device))
+
+    #             training_tds = []
+    #             for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+    #                 for _ in range(
+    #                     -(
+    #                         -self.config.train_batch_size(self.on_policy)
+    #                         // self.config.train_minibatch_size(self.on_policy)
+    #                     )
+    #                 ):
+    #                     training_tds.append(self._optimizer_loop(group))
+    #             training_td = torch.stack(training_tds)
+    #             self.logger.log_training(
+    #                 group, training_td, step=self.n_iters_performed
+    #             )
+
+    #             # Callback
+    #             self._on_train_end(training_td, group)
+
+    #             # Exploration update
+    #             if isinstance(self.group_policies[group], TensorDictSequential):
+    #                 explore_layer = self.group_policies[group][-1]
+    #             else:
+    #                 explore_layer = self.group_policies[group]
+    #             if hasattr(explore_layer, "step"):  # Step exploration annealing
+    #                 explore_layer.step(current_frames)
+
+    #         # Update policy in collector
+    #         if not self.config.collect_with_grad:
+    #             self.collector.update_policy_weights_()
+
+    #         # Training timer
+    #         training_time = time.time() - training_start
+
+    #         # Evaluation
+    #         if (
+    #             self.config.evaluation
+    #             and (
+    #                 self.total_frames % self.config.evaluation_interval == 0
+    #                 or self.n_iters_performed == 0
+    #             )
+    #             and (len(self.config.loggers) or self.config.create_json)
+    #         ):
+    #             self._evaluation_loop()
+
+    #         # End of step
+    #         iteration_time = time.time() - iteration_start
+    #         self.total_time += iteration_time
+    #         self.logger.log(
+    #             {
+    #                 "timers/collection_time": collection_time,
+    #                 "timers/training_time": training_time,
+    #                 "timers/iteration_time": iteration_time,
+    #                 "timers/total_time": self.total_time,
+    #                 "counters/current_frames": current_frames,
+    #                 "counters/total_frames": self.total_frames,
+    #                 "counters/iter": self.n_iters_performed,
+    #             },
+    #             step=self.n_iters_performed,
+    #         )
+    #         self.n_iters_performed += 1
+    #         self.logger.commit()
+    #         if (
+    #             self.config.checkpoint_interval > 0
+    #             and self.total_frames % self.config.checkpoint_interval == 0
+    #         ):
+    #             self._save_experiment()
+    #         pbar.update()
+
+    #     if self.config.checkpoint_at_end:
+    #         self._save_experiment()
+    #     self.close()
 
     def close(self):
         """Close the experiment."""

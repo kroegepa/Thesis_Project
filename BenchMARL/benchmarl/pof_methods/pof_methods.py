@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 def pof_transform(batch, task_name):
     #Add supported tasks here
     if task_name not in (
@@ -11,6 +13,45 @@ def pof_transform(batch, task_name):
     
     batch = pursuit_grouping(batch)
     return batch
+
+class GroupingCNN(nn.Module):
+    def __init__(self, act_dim, num_classes=3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # 7x7x3 → 7x7x16
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),  # 7x7x32
+            nn.ReLU(),
+            nn.Flatten()  # 7*7*32 = 1568
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(1568 + act_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, obs_grid, action):
+        """
+        obs_grid: [N, 3, 7, 7]  (C, H, W)
+        action:   [N, act_dim]
+        """
+        x = self.conv(obs_grid)
+        x = torch.cat([x, action], dim=-1)
+        return self.fc(x)  # [N, num_classes]
+
+# class GroupingNet(nn.Module):
+#     def __init__(self, obs_dim, act_dim, hidden=128, out_dim=3):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(obs_dim + act_dim, hidden),
+#             nn.ReLU(),
+#             nn.Linear(hidden, out_dim)
+#         )
+
+#     def forward(self, obs, act):
+#         x = torch.cat([obs, act], dim=-1)
+#         return self.net(x)  # shape: [N, 3]
+
 def calc_agent_position(observation_size):
     #I think this is only right for uneven observation sizes
     return (observation_size // 2) + 1
