@@ -669,7 +669,7 @@ class Experiment(CallbackNotifier):
             f"Evaluation results logged to loggers={self.config.loggers}"
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
-    def train_grouping_model_from_warmup(self, warmup_batches):
+    def pursuit_train_grouping_model_from_warmup(self, warmup_batches):
         obs_list, act_list, label_list = [], [], []
 
         for batch in warmup_batches:
@@ -791,7 +791,7 @@ class Experiment(CallbackNotifier):
 
         # Warm-up loop and main training loop separated
 
-    def predict(self, batch):
+    def pursuit_predict(self, batch):
         obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
         act = batch["pursuer"]["action"]       # [B, T, A]  (discrete)
 
@@ -876,7 +876,7 @@ class Experiment(CallbackNotifier):
 
         # Train grouping model after warm-up
 
-        self.train_grouping_model_from_warmup(warmup_data)
+        #self.train_grouping_model_from_warmup(warmup_data)
 
         # Reset policy to prevent bleedover
         self.policy = self.algorithm.get_policy_for_collection()
@@ -906,7 +906,7 @@ class Experiment(CallbackNotifier):
                         done_keys=self.rollout_env.done_keys,
                      )
 
-            grouping_tensor = self.predict(batch)  # Group per timestep
+            #grouping_tensor = self.predict(batch)  # Group per timestep
 
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(
