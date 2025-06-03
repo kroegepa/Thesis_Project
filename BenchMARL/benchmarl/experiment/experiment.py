@@ -36,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, GroupingCNN
+from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, GroupingCNN, spread_grouping
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -906,7 +906,7 @@ class Experiment(CallbackNotifier):
                         done_keys=self.rollout_env.done_keys,
                      )
 
-            #grouping_tensor = self.predict(batch)  # Group per timestep
+            grouping_tensor = spread_grouping(batch)  # Group per timestep
 
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(

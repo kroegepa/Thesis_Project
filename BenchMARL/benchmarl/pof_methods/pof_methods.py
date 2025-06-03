@@ -10,8 +10,10 @@ def pof_transform(batch, task_name):
     
     #Should make this part of the task object!
 
-    
-    batch = pursuit_grouping(batch)
+    if task_name == "pursuit":
+        batch = pursuit_grouping(batch)
+    if task_name == "simeple_spread":
+        batch = spread_grouping(batch)
     return batch
 
 class GroupingCNN(nn.Module):
@@ -55,10 +57,26 @@ class GroupingCNN(nn.Module):
 def calc_agent_position(observation_size):
     #I think this is only right for uneven observation sizes
     return (observation_size // 2) + 1
+
+def spread_grouping(batch):
+    reward = batch["next"]["agent"]["reward"]  # shape: [B, T, A, 1]
+    grouping_tensor = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
+
+    for b in range(reward.shape[0]):
+        for t in range(reward.shape[1]):
+            rewards_t = reward[b, t, :, 0]  # shape: [A]
+            unique_vals = rewards_t.unique().sort().values  # up to 3 unique rewards
+
+            for g, val in enumerate(unique_vals[:3]):  # up to 3 groups
+                mask = rewards_t == val
+                grouping_tensor[b, t, mask, g] = 1
+
+    return grouping_tensor  # shape: [B, T, A, 3]
+
 def pursuit_grouping(batch):
     # Placeholder: determine which agents are near an evader based on obs and action
     #Batch Time and agent dimension
-    obs = batch["pursuer"]["observation"]  # shape: [B, T, A, obs_dim]
+    #obs = batch["pursuer"]["observation"]  # shape: [B, T, A, obs_dim]
     #action = batch["pursuer"]["action"]  # shape: [B, T, A, action_dim]
     reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
     grouping_tensor = torch.zeros((*reward.shape[:-1],3),dtype=torch.float32)
@@ -91,7 +109,7 @@ def pursuit_grouping(batch):
 
 
 def grouping_reward_averaging(batch, grouping_tensor):
-    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["next"]["agent"]["reward"]  # shape: [B, T, A, 1]
     # Loop over groups 0, 1, 2
     new_reward = reward.clone()
     device = reward.device
@@ -109,7 +127,7 @@ def grouping_reward_averaging(batch, grouping_tensor):
         new_reward[group_mask.bool()] = group_mean.expand_as(new_reward)[group_mask.bool()]
     
     # Save new reward back into batch
-    batch["next"]["pursuer"]["reward"] = new_reward
+    batch["next"]["agent"]["reward"] = new_reward
     return batch
 
 def touching_distance(observation,x,y):
