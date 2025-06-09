@@ -36,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, GroupingCNN, spread_grouping
+from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -97,6 +97,7 @@ class ExperimentConfig:
     max_n_iters: Optional[int] = MISSING
     max_n_frames: Optional[int] = MISSING
 
+    train_grouping_warmup: bool = MISSING
     warmup_iters: int = MISSING
 
     on_policy_collected_frames_per_batch: int = MISSING
@@ -669,10 +670,10 @@ class Experiment(CallbackNotifier):
             f"Evaluation results logged to loggers={self.config.loggers}"
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
-    def pursuit_train_grouping_model_from_warmup(self, warmup_batches):
-        obs_list, act_list, label_list = [], [], []
+    def train_grouping_model_from_warmup(self, batch):
+        if self.task_name == "pursuit":
+            obs_list, act_list, label_list = [], [], []
 
-        for batch in warmup_batches:
             obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
             act = batch["pursuer"]["action"]       # [B, T, A, act_dim]
             reward = batch["next"]["pursuer"]["reward"]  # [B, T, A, 1]
@@ -694,13 +695,27 @@ class Experiment(CallbackNotifier):
             act_list.append(act_onehot.reshape(-1, act_dim))            
             obs_list.append(obs.reshape(-1, 3, 7, 7))
             label_list.append(group.argmax(dim=-1).view(-1))
+        elif self.task_name == "simple_spread":
+            obs_list, act_list, label_list = [], [], []
+
+            obs = batch["agent"]["observation"]  # [B, T, A, 30]
+            act = batch["agent"]["action"]       # [B, T, A, 5]
+            reward = batch["next"]["agent"]["reward"]  
+            group = spread_grouping(batch)
+            act_dim = 5 
+            #   obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+            act_list.append(act.reshape(-1, act_dim))            
+            obs_list.append(obs.reshape(-1, 30))
+            label_list.append(group.argmax(dim=-1).view(-1))
 
         obs_tensor = torch.cat(obs_list, dim=0)
         act_tensor = torch.cat(act_list, dim=0)
         label_tensor = torch.cat(label_list, dim=0)
         device = obs_tensor.device
-        self.grouping_model = GroupingCNN(act_tensor.shape[-1]).to(device)
-
+        if self.task_name == "pursuit":
+            self.grouping_model = PursuitGroupingCNN(act_tensor.shape[-1]).to(device)
+        if self.task_name == "simple_spread":
+            self.grouping_model = SpreadGroupingMLP().to(device)
         dataset = TensorDataset(obs_tensor, act_tensor, label_tensor)
         dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
 
@@ -791,30 +806,40 @@ class Experiment(CallbackNotifier):
 
         # Warm-up loop and main training loop separated
 
-    def pursuit_predict(self, batch):
-        obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
-        act = batch["pursuer"]["action"]       # [B, T, A]  (discrete)
+    def predict_grouping(self, batch):
+        if self.task_name == "pursuit":
+            obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
+            act = batch["pursuer"]["action"]       # [B, T, A]  (discrete)
 
-        # Reshape correctly
-        B, T, A = obs.shape[:3]
-        obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-        obs = obs.reshape(-1, 3, 7, 7)  # [B*T*A, C, H, W]
-        # One-hot encode actions
-        act_dim = 5
-        act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
+            # Reshape correctly
+            B, T, A = obs.shape[:3]
+            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+            obs = obs.reshape(-1, 3, 7, 7)
+            # One-hot encode actions
+            act_dim = 5
+            act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
+        if self.task_name == "simple_spread":
+            obs = batch["agent"]["observation"]  # [B, T, A, 7, 7, 3]
+            act = batch["agent"]["action"]       # [B, T, A]  (discrete)
 
+            # Reshape correctly
+            B, T, A = obs.shape[:3]
+            obs = obs.reshape(-1, 30)
+            # One-hot encode actions
+            act_dim = 5
+            act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]
         # Run model
         with torch.no_grad():
             logits = self.grouping_model(obs, act)  # [B*T*A, 3]
             group_idx = logits.argmax(dim=-1).view(B, T, A)
-            return F.one_hot(group_idx, num_classes=3).float()  # [B, T, A, 3]
+            return F.one_hot(group_idx, num_classes=logits.shape[-1]).float()  # [B, T, A, 3]
 
 
         with torch.no_grad():
             logits = self.grouping_model(obs.view(-1, obs.shape[-1]), act.view(-1, act.shape[-1]))
             group_idx = logits.argmax(dim=-1).view(B, T, A)
             # Convert to one-hot tensor of shape [B, T, A, 3]
-            return F.one_hot(group_idx, num_classes=3).float()
+            return F.one_hot(group_idx, num_classes=self.grouping_model.shape[-1]).float()
 
 
     def _collection_loop(self):
@@ -830,53 +855,53 @@ class Experiment(CallbackNotifier):
             iterator = iter(self.collector)
         else:
             reset_batch = self.rollout_env.reset()
+        
 
-        # === Warm-up Phase ===
-        for warmup_step in range(warmup_iters):
-            if not self.config.collect_with_grad:
-                batch = next(iterator)
-            else:
-                with set_exploration_type(ExplorationType.RANDOM):
-                    batch = self.rollout_env.rollout(
-                        max_steps=-(
-                            -self.config.collected_frames_per_batch(self.on_policy)
-                            // self.rollout_env.batch_size.numel()
-                        ),
-                        policy=self.policy,
-                        break_when_any_done=False,
-                        auto_reset=False,
-                        tensordict=reset_batch,
-                    )
-                    reset_batch = step_mdp(
-                        batch[..., -1],
-                        reward_keys=self.rollout_env.reward_keys,
-                        action_keys=self.rollout_env.action_keys,
-                        done_keys=self.rollout_env.done_keys,
-                     )
-
-            warmup_data.append(batch.detach())
-
-            self._on_batch_collected(batch)
-            batch = batch.detach()
-            for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
-                group_batch = self.algorithm.process_batch(group, group_batch)
-                if not self.algorithm.has_rnn:
-                    group_batch = group_batch.reshape(-1)
-                group_buffer = self.replay_buffers[group]
-                group_buffer.extend(group_batch.to(group_buffer.storage.device))
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                    for _ in range(
-                        -(
-                            -self.config.train_batch_size(self.on_policy)
-                            // self.config.train_minibatch_size(self.on_policy)
+        if self.config.train_grouping_warmup:
+            # === Warm-up Phase ===
+            for warmup_step in range(warmup_iters):
+                if not self.config.collect_with_grad:
+                    batch = next(iterator)
+                else:
+                    with set_exploration_type(ExplorationType.RANDOM):
+                        batch = self.rollout_env.rollout(
+                            max_steps=-(
+                                -self.config.collected_frames_per_batch(self.on_policy)
+                                // self.rollout_env.batch_size.numel()
+                            ),
+                            policy=self.policy,
+                            break_when_any_done=False,
+                            auto_reset=False,
+                            tensordict=reset_batch,
                         )
-                    ):
-                        self._optimizer_loop(group)
+                        reset_batch = step_mdp(
+                            batch[..., -1],
+                            reward_keys=self.rollout_env.reward_keys,
+                            action_keys=self.rollout_env.action_keys,
+                            done_keys=self.rollout_env.done_keys,
+                         )
+                        warmup_data.append(batch.detach())
+                        self._on_batch_collected(batch)
+                batch = batch.detach()
+                for group in self.train_group_map.keys():
+                    group_batch = batch.exclude(*self._get_excluded_keys(group))
+                    group_batch = self.algorithm.process_batch(group, group_batch)
+                    if not self.algorithm.has_rnn:
+                        group_batch = group_batch.reshape(-1)
+                    group_buffer = self.replay_buffers[group]
+                    group_buffer.extend(group_batch.to(group_buffer.storage.device))
+                    for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                        for _ in range(
+                            -(
+                                -self.config.train_batch_size(self.on_policy)
+                                // self.config.train_minibatch_size(self.on_policy)
+                            )
+                        ):
+                            self._optimizer_loop(group)
+                self.train_grouping_model_from_warmup(batch)
 
-        # Train grouping model after warm-up
+                # Train grouping model after warm-up
 
-        #self.train_grouping_model_from_warmup(warmup_data)
 
         # Reset policy to prevent bleedover
         self.policy = self.algorithm.get_policy_for_collection()
@@ -906,7 +931,7 @@ class Experiment(CallbackNotifier):
                         done_keys=self.rollout_env.done_keys,
                      )
 
-            grouping_tensor = spread_grouping(batch)  # Group per timestep
+            grouping_tensor = self.predict_grouping(batch)  # Group per timestep
 
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(

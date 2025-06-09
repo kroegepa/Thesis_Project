@@ -16,7 +16,28 @@ def pof_transform(batch, task_name):
         batch = spread_grouping(batch)
     return batch
 
-class GroupingCNN(nn.Module):
+
+class SpreadGroupingMLP(nn.Module):
+    def __init__(self, obs_dim=30, act_dim=5, hidden_dim=128, num_groups=3):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_groups)
+        )
+
+    def forward(self, obs, action):
+        """
+        obs: [N, obs_dim]
+        action: [N, act_dim]
+        returns: [N, num_groups] logits
+        """
+        x = torch.cat([obs, action], dim=-1)  # [N, obs_dim + act_dim]
+        return self.fc(x)  # [N, num_groups]
+
+class PursuitGroupingCNN(nn.Module):
     def __init__(self, act_dim, num_classes=3):
         super().__init__()
         self.conv = nn.Sequential(
