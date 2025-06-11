@@ -24,6 +24,7 @@ from torchrl.record.loggers import get_logger
 from torchrl.record.loggers.wandb import WandbLogger
 
 from benchmarl.environments import Task
+import wandb
 
 
 class Logger:
@@ -203,7 +204,9 @@ class Logger:
             rollouts[i] = r
 
         to_log = {}
+        to_log_eval = {}
         json_metrics = {}
+        eval_table = wandb.Table(columns=["step", "seed", "reward"])
         for group in self.group_map.keys():
             # returns has shape (n_episodes)
             returns = torch.stack(
@@ -212,6 +215,9 @@ class Logger:
             )
             self._log_min_mean_max(
                 to_log, f"eval/{group}/reward/episode_reward", returns
+            )
+            self._log_evaluation_spread(
+                to_log_eval, f"eval/{group}/reward/episode_reward", returns
             )
             json_metrics[group + "_return"] = returns
 
@@ -240,6 +246,12 @@ class Logger:
                     )
 
         self.log(to_log, step=step)
+        self.log_evaluation_seeds(
+            eval_dict=to_log_eval,
+            key="eval/return/episode_reward",
+            step=step,
+            wandb_table=eval_table
+            )
         if video_frames is not None and max_length_rollout_0 > 1:
             video_frames = np.stack(video_frames[: max_length_rollout_0 - 1], axis=0)
             vid = torch.tensor(
@@ -272,6 +284,18 @@ class Logger:
             else:
                 for key, value in dict_to_log.items():
                     logger.log_scalar(key.replace("/", "_"), value, step=step)
+    def log_evaluation_seeds(self, eval_dict: Dict, key = None, step: int = None, wandb_table = None):
+        for logger in self.loggers:
+            if isinstance(logger, WandbLogger):
+                for key,val in eval_dict.items():
+                    for i, value in enumerate(val):
+                        wandb_table.add_data(step,i, value)
+                logger.experiment.log({key + "_boxplot": wandb_table}, commit=False)            
+            else:
+                for key, val in eval_dict.items():
+                    for i, value in enumerate(val):
+                        key_i = f"{key}_seed_{i}"
+                        logger.log_scalar(key_i.replace("/", "_"), value, step=step)
 
     def finish(self):
         for logger in self.loggers:
@@ -389,7 +413,12 @@ class Logger:
                 key + "_max": value.max().item(),
             }
         )
-
+    def _log_evaluation_spread(self, to_log: Dict[str, Tensor], key: str, value: Tensor):
+            to_log.update(
+                {
+                key : value.tolist(),
+                }
+            )
 
 class JsonWriter:
     """

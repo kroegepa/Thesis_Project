@@ -819,8 +819,8 @@ class Experiment(CallbackNotifier):
             act_dim = 5
             act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
         if self.task_name == "simple_spread":
-            obs = batch["agent"]["observation"]  # [B, T, A, 7, 7, 3]
-            act = batch["agent"]["action"]       # [B, T, A]  (discrete)
+            obs = batch["agent"]["observation"]  # [B, T, A, 30]
+            act = batch["agent"]["action"]       # [B, T, A, 5] (continuous)
 
             # Reshape correctly
             B, T, A = obs.shape[:3]
