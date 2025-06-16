@@ -18,6 +18,7 @@ import torchrl
 
 from tensordict import TensorDictBase
 from torch import Tensor
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from torchrl.record import TensorboardLogger
 from torchrl.record.loggers import get_logger
@@ -48,6 +49,8 @@ class Logger:
         self.model_name = model_name
         self.group_map = group_map
         self.seed = seed
+        self.eval_table = wandb.Table(columns=["step", "reward"])
+        self.eval_key = "eval/return/episode_reward"
 
         if experiment_config.create_json:
             self.json_writer = JsonWriter(
@@ -166,6 +169,26 @@ class Logger:
 
         self.log(to_log, step=step)
         return global_episode_rewards.mean().item()
+    
+    def log_grouping(self, group: str, oracle_labels: torch.Tensor, predicted_labels: torch.Tensor, step: int):
+
+      #TODO: Extend for different groups present
+      # Ensure inputs are on CPU and flattened
+      y_true = oracle_labels.argmax(dim=-1).view(-1).numpy()
+      y_pred = predicted_labels.argmax(dim=-1).view(-1).numpy()
+      
+      labels=[i for i in range(oracle_labels.shape[-1])]
+      precision = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
+      recall = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
+      f1 = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
+
+      to_log = {
+          f"grouping/{group}/precision": precision,
+          f"grouping/{group}/recall": recall,
+          f"grouping/{group}/f1_score": f1,
+      }
+
+      self.log(to_log, step=step)
 
     def log_training(self, group: str, training_td: TensorDictBase, step: int):
         if not len(self.loggers):
@@ -206,7 +229,6 @@ class Logger:
         to_log = {}
         to_log_eval = {}
         json_metrics = {}
-        eval_table = wandb.Table(columns=["step", "seed", "reward"])
         for group in self.group_map.keys():
             # returns has shape (n_episodes)
             returns = torch.stack(
@@ -250,7 +272,6 @@ class Logger:
             eval_dict=to_log_eval,
             key="eval/return/episode_reward",
             step=step,
-            wandb_table=eval_table
             )
         if video_frames is not None and max_length_rollout_0 > 1:
             video_frames = np.stack(video_frames[: max_length_rollout_0 - 1], axis=0)
@@ -284,19 +305,23 @@ class Logger:
             else:
                 for key, value in dict_to_log.items():
                     logger.log_scalar(key.replace("/", "_"), value, step=step)
-    def log_evaluation_seeds(self, eval_dict: Dict, key = None, step: int = None, wandb_table = None):
+    def log_evaluation_seeds(self, eval_dict: Dict, key = None, step: int = None):
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
                 for key,val in eval_dict.items():
-                    for i, value in enumerate(val):
-                        wandb_table.add_data(step,i, value)
-                logger.experiment.log({key + "_boxplot": wandb_table}, commit=False)            
+                    for value in val:
+                        self.eval_table.add_data(step, value)
             else:
                 for key, val in eval_dict.items():
                     for i, value in enumerate(val):
                         key_i = f"{key}_seed_{i}"
                         logger.log_scalar(key_i.replace("/", "_"), value, step=step)
-
+    def log_evaluation_table(self):
+        for logger in self.loggers:
+            if isinstance(logger, WandbLogger):
+                logger.experiment.log({self.eval_key + "_boxplot": self.eval_table}, commit=True)
+            else:
+                pass
     def finish(self):
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
@@ -411,6 +436,7 @@ class Logger:
                 key + "_min": value.min().item(),
                 key + "_mean": value.mean().item(),
                 key + "_max": value.max().item(),
+                key + "_std": value.std().item(),
             }
         )
     def _log_evaluation_spread(self, to_log: Dict[str, Tensor], key: str, value: Tensor):

@@ -49,6 +49,10 @@ reward_perturbation_flip_prob: 0.1
 
 #Whether to include power of friendship(pfo) reward robustness mechanism
 pof_enable: False
+#Whether to use original reward for grouping
+oracle_grouping: False
+#Whether to evaluate the grouping
+evaluate_grouping: True
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
@@ -61,10 +65,11 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-max_n_frames: 6_000_000
+max_n_frames: 1_800_000
 
+train_grouping_no_warmup: False
 train_grouping_warmup: True
-warmup_iters: 1
+warmup_iters: 10
 
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 6000

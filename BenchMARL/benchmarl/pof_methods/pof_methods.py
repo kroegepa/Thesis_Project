@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.mixture import GaussianMixture
+
+
+
 def pof_transform(batch, task_name):
     #Add supported tasks here
     if task_name not in (
@@ -38,7 +42,7 @@ class SpreadGroupingMLP(nn.Module):
         return self.fc(x)  # [N, num_groups]
 
 class PursuitGroupingCNN(nn.Module):
-    def __init__(self, act_dim, num_classes=3):
+    def __init__(self, act_dim=5, num_classes=3):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),  # 7x7x3 → 7x7x16
@@ -79,6 +83,14 @@ def calc_agent_position(observation_size):
     #I think this is only right for uneven observation sizes
     return (observation_size // 2) + 1
 
+def oracle_grouping(batch, task_name):
+    if task_name == "pursuit":
+        return pursuit_grouping(batch)
+    elif task_name == "simple_spread":
+        return spread_grouping(batch)
+    else:
+        raise NotImplementedError(f"Task {task_name} not supported for oracle grouping.")
+
 def spread_grouping(batch):
     reward = batch["next"]["agent"]["reward"]  # shape: [B, T, A, 1]
     grouping_tensor = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
@@ -93,6 +105,39 @@ def spread_grouping(batch):
                 grouping_tensor[b, t, mask, g] = 1
 
     return grouping_tensor  # shape: [B, T, A, 3]
+
+
+def pursuit_grouping_fuzzy(batch, n_groups=3):
+    """
+    Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
+    Produces one-hot hard assignments (argmax over soft probabilities).
+    
+    Args:
+        batch (TensorDict): contains ["next"]["pursuer"]["reward"] of shape [B, T, A, 1]
+        n_groups (int): number of clusters to create (default 3)
+        
+    Returns:
+        grouping_tensor: [B, T, A, n_groups] with one-hot group assignments
+    """
+    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
+    B, T, A, _ = reward.shape
+
+    # Flatten to [N, 1]
+    rewards_np = reward.view(-1, 1).detach().numpy()
+
+    # Fit GMM on all rewards in batch
+    gmm = GaussianMixture(n_components=n_groups, covariance_type="full", random_state=0)
+    gmm.fit(rewards_np)
+
+    # Predict group (hard assignment)
+    group_ids = gmm.predict(rewards_np)  # shape: [N]
+
+    # Convert to one-hot
+    group_tensor = torch.nn.functional.one_hot(torch.tensor(group_ids), num_classes=n_groups).float()  # [N, n_groups]
+    grouping_tensor = group_tensor.view(B, T, A, n_groups).to(reward.device)
+
+    return grouping_tensor
+
 
 def pursuit_grouping(batch):
     # Placeholder: determine which agents are near an evader based on obs and action
@@ -109,9 +154,9 @@ def pursuit_grouping(batch):
     for b in range(reward.shape[0]):
         for t in range(reward.shape[1]):
             for a in range(reward.shape[2]):
-                if abs(reward[b,t,a,0]) > 2:  # Threshold for grouping
+                if reward[b,t,a,0] > 2:  # Threshold for grouping
                     grouping_tensor[b,t,a,2] = 1
-                elif abs(reward[b,t,a,0]) >= -0.9:  # Threshold for grouping
+                elif reward[b,t,a,0] > -0.1:  # Threshold for grouping
                     grouping_tensor[b,t,a,1] = 1
                 else:
                     grouping_tensor[b,t,a,0] = 1

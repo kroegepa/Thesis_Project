@@ -36,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import pursuit_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP
+from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -90,6 +90,9 @@ class ExperimentConfig:
     reward_perturbation_flip_prob: float = MISSING
 
     pof_enable: bool = MISSING
+    oracle_grouping: bool = MISSING
+    evaluate_grouping: bool = MISSING
+
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
     exploration_anneal_frames: Optional[int] = MISSING
@@ -97,6 +100,7 @@ class ExperimentConfig:
     max_n_iters: Optional[int] = MISSING
     max_n_frames: Optional[int] = MISSING
 
+    train_grouping_no_warmup: bool = MISSING
     train_grouping_warmup: bool = MISSING
     warmup_iters: int = MISSING
 
@@ -670,7 +674,7 @@ class Experiment(CallbackNotifier):
             f"Evaluation results logged to loggers={self.config.loggers}"
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
-    def train_grouping_model_from_warmup(self, batch):
+    def train_grouping_model(self, batch):
         if self.task_name == "pursuit":
             obs_list, act_list, label_list = [], [], []
 
@@ -678,17 +682,10 @@ class Experiment(CallbackNotifier):
             act = batch["pursuer"]["action"]       # [B, T, A, act_dim]
             reward = batch["next"]["pursuer"]["reward"]  # [B, T, A, 1]
             act_dim = 5
-            group = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
-            for b in range(reward.shape[0]):
-                for t in range(reward.shape[1]):
-                    for a in range(reward.shape[2]):
-                        r = reward[b, t, a, 0]
-                        if abs(r) > 2:
-                            group[b, t, a, 2] = 1
-                        elif abs(r) >= -0.9:
-                            group[b, t, a, 1] = 1
-                        else:
-                            group[b, t, a, 0] = 1
+            if self.config.train_grouping_no_warmup:
+                pass
+            else:
+                group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
 
             obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
             act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim)  # [B, T, A, act_dim]
@@ -712,10 +709,6 @@ class Experiment(CallbackNotifier):
         act_tensor = torch.cat(act_list, dim=0)
         label_tensor = torch.cat(label_list, dim=0)
         device = obs_tensor.device
-        if self.task_name == "pursuit":
-            self.grouping_model = PursuitGroupingCNN(act_tensor.shape[-1]).to(device)
-        if self.task_name == "simple_spread":
-            self.grouping_model = SpreadGroupingMLP().to(device)
         dataset = TensorDataset(obs_tensor, act_tensor, label_tensor)
         dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
 
@@ -850,7 +843,10 @@ class Experiment(CallbackNotifier):
 
         warmup_iters = self.config.warmup_iters
         warmup_data = []
-
+        if self.task_name == "pursuit":
+            self.grouping_model = PursuitGroupingCNN().to(self.config.train_device)
+        if self.task_name == "simple_spread":
+            self.grouping_model = SpreadGroupingMLP().to(self.config.train_device)
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
@@ -898,7 +894,7 @@ class Experiment(CallbackNotifier):
                             )
                         ):
                             self._optimizer_loop(group)
-                self.train_grouping_model_from_warmup(batch)
+                self.train_grouping_model(batch)
 
                 # Train grouping model after warm-up
 
@@ -930,9 +926,19 @@ class Experiment(CallbackNotifier):
                         action_keys=self.rollout_env.action_keys,
                         done_keys=self.rollout_env.done_keys,
                      )
-
-            grouping_tensor = self.predict_grouping(batch)  # Group per timestep
-
+            if self.config.oracle_grouping:
+                # Use oracle grouping if enabled
+                grouping_tensor = oracle_grouping(batch, self.task_name)
+            else:
+                grouping_tensor = self.predict_grouping(batch)  # Group per timestep
+            if self.config.evaluate_grouping:
+                for group in self.train_group_map.keys():
+                    self.logger.log_grouping(
+                        group,
+                        oracle_grouping(batch, self.task_name),
+                        grouping_tensor,
+                        step=self.n_iters_performed,
+                    )
             if self.config.reward_perturbation:
                 batch = self._apply_reward_perturbation(
                     batch,
@@ -1027,6 +1033,7 @@ class Experiment(CallbackNotifier):
 
         if self.config.checkpoint_at_end:
             self._save_experiment()
+        self.logger.log_evaluation_table()
         self.close()
 
 
