@@ -123,7 +123,7 @@ def pursuit_grouping_fuzzy(batch, n_groups=3):
     B, T, A, _ = reward.shape
 
     # Flatten to [N, 1]
-    rewards_np = reward.view(-1, 1).detach().numpy()
+    rewards_np = reward.view(-1, 1).detach().cpu().numpy()
 
     # Fit GMM on all rewards in batch
     gmm = GaussianMixture(n_components=n_groups, covariance_type="full", random_state=0)

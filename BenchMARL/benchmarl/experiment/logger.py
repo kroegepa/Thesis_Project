@@ -174,8 +174,8 @@ class Logger:
 
       #TODO: Extend for different groups present
       # Ensure inputs are on CPU and flattened
-      y_true = oracle_labels.argmax(dim=-1).view(-1).numpy()
-      y_pred = predicted_labels.argmax(dim=-1).view(-1).numpy()
+      y_true = oracle_labels.argmax(dim=-1).view(-1).cpu().numpy()
+      y_pred = predicted_labels.argmax(dim=-1).view(-1).cpu().numpy()
       
       labels=[i for i in range(oracle_labels.shape[-1])]
       precision = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
