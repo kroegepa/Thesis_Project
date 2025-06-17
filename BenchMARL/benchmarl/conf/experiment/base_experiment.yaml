@@ -52,7 +52,7 @@ pof_enable: False
 #Whether to use original reward for grouping
 oracle_grouping: False
 #Whether to evaluate the grouping
-evaluate_grouping: True
+evaluate_grouping: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
@@ -68,7 +68,7 @@ max_n_iters: null
 max_n_frames: 1_800_000
 
 train_grouping_no_warmup: False
-train_grouping_warmup: True
+train_grouping_warmup: False
 warmup_iters: 10
 
 # Number of frames collected and each experiment iteration
@@ -125,6 +125,9 @@ loggers: [csv,wandb]
 project_name: "benchmarl"
 # Create a json folder as part of the output in the format of marl-eval
 create_json: True
+# Custom name for the experiment, if set, this will override the hydra job name
+set_custom_name: False
+custom_name: null
 
 # Absolute path to the folder where the experiment will log.
 # If null, this will default to the hydra output dir (if using hydra) or to the current folder when the script is run (if not).

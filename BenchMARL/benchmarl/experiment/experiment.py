@@ -130,6 +130,8 @@ class ExperimentConfig:
     project_name: str = MISSING
     create_json: bool = MISSING
 
+    set_custom_name: bool = MISSING
+    custom_name: Optional[str] = MISSING
     save_folder: Optional[str] = MISSING
     restore_file: Optional[str] = MISSING
     restore_map_location: Optional[Any] = MISSING
@@ -605,9 +607,13 @@ class Experiment(CallbackNotifier):
                     save_folder = Path(os.getcwd())
 
         if self.config.restore_file is None:
-            self.name = generate_exp_name(
-                f"{self.algorithm_name}_{self.task_name}_{self.model_name}", ""
-            )
+            if self.config.set_custom_name:
+                # If the user specified a custom name, we use that
+                self.name = self.config.custom_name
+            else:
+                self.name = generate_exp_name(
+                    f"{self.algorithm_name}_{self.task_name}_{self.model_name}", ""
+                )
             self.folder_name = save_folder / self.name
 
         else:

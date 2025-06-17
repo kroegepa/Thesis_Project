@@ -175,6 +175,7 @@ def pursuit_grouping(batch):
 
 
 def grouping_reward_averaging(batch, grouping_tensor):
+    #TODO MAKE IT TASK AGNOSTIC
     reward = batch["next"]["pursuit"]["reward"]  # shape: [B, T, A, 1]
     # Loop over groups 0, 1, 2
     new_reward = reward.clone()
