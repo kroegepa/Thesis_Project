@@ -900,6 +900,8 @@ class Experiment(CallbackNotifier):
                             )
                         ):
                             self._optimizer_loop(group)
+                for group in self.train_group_map.keys():
+                    batch[group]["original_reward"] = batch["next"][group]["reward"].clone()
                 self.train_grouping_model(batch)
 
                 # Train grouping model after warm-up
