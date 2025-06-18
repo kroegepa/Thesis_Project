@@ -65,7 +65,7 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-max_n_frames: 1_800_000
+max_n_frames: 1_500_000
 
 train_grouping_no_warmup: False
 train_grouping_warmup: False

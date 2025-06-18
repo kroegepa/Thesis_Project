@@ -107,6 +107,28 @@ def spread_grouping(batch):
     return grouping_tensor  # shape: [B, T, A, 3]
 
 
+def fuzzy_grouping(batch, task_name,  n_groups=3):
+    """
+    Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
+    Produces soft probabilities for each group.
+    
+    Args:
+        batch (TensorDict): contains ["next"]["agent"]["reward"] of shape [B, T, A, 1]
+        n_groups (int): number of clusters to create (default 3)
+        task_name (str): name of the task (e.g., "pursuit", "simple_spread")
+        
+    Returns:
+        grouping_tensor: [B, T, A, n_groups] with soft probabilities for each group
+    """
+    if task_name == "pursuit":
+        return pursuit_grouping_fuzzy(batch, n_groups)
+    elif task_name == "simple_spread":
+        return spread_grouping_fuzzy(batch, n_groups)
+    else:
+        raise NotImplementedError(f"Task {task_name} not supported for fuzzy grouping.")
+    
+def spread_grouping_fuzzy(batch, n_groups=3):
+    pass
 def pursuit_grouping_fuzzy(batch, n_groups=3):
     """
     Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
@@ -144,7 +166,7 @@ def pursuit_grouping(batch):
     #Batch Time and agent dimension
     #obs = batch["pursuer"]["observation"]  # shape: [B, T, A, obs_dim]
     #action = batch["pursuer"]["action"]  # shape: [B, T, A, action_dim]
-    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["pursuer"]["original_reward"]  # shape: [B, T, A, 1]
     grouping_tensor = torch.zeros((*reward.shape[:-1],3),dtype=torch.float32)
     #Just time dimension
     #max_group_vector = torch.zeros(reward.shape[1])
@@ -176,7 +198,7 @@ def pursuit_grouping(batch):
 
 def grouping_reward_averaging(batch, grouping_tensor):
     #TODO MAKE IT TASK AGNOSTIC
-    reward = batch["next"]["pursuit"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
     # Loop over groups 0, 1, 2
     new_reward = reward.clone()
     device = reward.device
@@ -194,7 +216,7 @@ def grouping_reward_averaging(batch, grouping_tensor):
         new_reward[group_mask.bool()] = group_mean.expand_as(new_reward)[group_mask.bool()]
     
     # Save new reward back into batch
-    batch["next"]["pursuit"]["reward"] = new_reward
+    batch["next"]["pursuer"]["reward"] = new_reward
     return batch
 
 def touching_distance(observation,x,y):

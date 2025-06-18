@@ -36,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP
+from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP, fuzzy_grouping
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -686,10 +686,9 @@ class Experiment(CallbackNotifier):
 
             obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
             act = batch["pursuer"]["action"]       # [B, T, A, act_dim]
-            reward = batch["next"]["pursuer"]["reward"]  # [B, T, A, 1]
             act_dim = 5
             if self.config.train_grouping_no_warmup:
-                pass
+                group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
             else:
                 group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
 
@@ -742,6 +741,7 @@ class Experiment(CallbackNotifier):
             for group in self.group_map.keys():
                 # 1. Get the actual reward from `next`  
                 reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
+
 
                 # 2. Add Gaussian noise to per-step rewards
                 noise = torch.randn_like(reward) * stdev
@@ -932,10 +932,22 @@ class Experiment(CallbackNotifier):
                         action_keys=self.rollout_env.action_keys,
                         done_keys=self.rollout_env.done_keys,
                      )
+            #Retain original reward
+            for group in self.group_map.keys():
+                batch[group]["original_reward"] = batch["next"][group]["reward"].clone()
+            if self.config.reward_perturbation:
+                batch = self._apply_reward_perturbation(
+                    batch,
+                    self.config.reward_perturbation_type,
+                    self.config.reward_perturbation_stdev,
+                    self.config.reward_perturbation_flip_prob
+                 )
             if self.config.oracle_grouping:
                 # Use oracle grouping if enabled
                 grouping_tensor = oracle_grouping(batch, self.task_name)
             else:
+                if self.config.train_grouping_no_warmup:
+                    self.train_grouping_model(batch)
                 grouping_tensor = self.predict_grouping(batch)  # Group per timestep
             if self.config.evaluate_grouping:
                 for group in self.train_group_map.keys():
@@ -945,13 +957,7 @@ class Experiment(CallbackNotifier):
                         grouping_tensor,
                         step=self.n_iters_performed,
                     )
-            if self.config.reward_perturbation:
-                batch = self._apply_reward_perturbation(
-                    batch,
-                    self.config.reward_perturbation_type,
-                    self.config.reward_perturbation_stdev,
-                    self.config.reward_perturbation_flip_prob
-                 )
+
 
             if self.config.pof_enable:
                 batch = grouping_reward_averaging(batch, grouping_tensor)

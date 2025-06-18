@@ -178,14 +178,21 @@ class Logger:
       y_pred = predicted_labels.argmax(dim=-1).view(-1).cpu().numpy()
       
       labels=[i for i in range(oracle_labels.shape[-1])]
-      precision = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
-      recall = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
-      f1 = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
+      precision_weighted = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
+      recall_weighted = recall_score(y_true, y_pred, average='weighted', labels=labels, zero_division=0)
+      f1_weighted = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
+
+      precision_macro = precision_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
+      recall_macro = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
+      f1_macro = f1_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)  
 
       to_log = {
-          f"grouping/{group}/precision": precision,
-          f"grouping/{group}/recall": recall,
-          f"grouping/{group}/f1_score": f1,
+          f"grouping/{group}/precision_weighted": precision_weighted,
+          f"grouping/{group}/recall_weighted": recall_weighted,
+          f"grouping/{group}/f1_score_weighted": f1_weighted,
+          f"grouping/{group}/precision_macro": precision_macro,
+          f"grouping/{group}/recall_macro": recall_macro,
+          f"grouping/{group}/f1_score_macro": f1_macro,
       }
 
       self.log(to_log, step=step)
