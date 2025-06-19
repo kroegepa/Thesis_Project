@@ -962,7 +962,7 @@ class Experiment(CallbackNotifier):
 
 
             if self.config.pof_enable:
-                batch = grouping_reward_averaging(batch, grouping_tensor)
+                batch = grouping_reward_averaging(batch, grouping_tensor, self.task_name)
 
             collection_time = time.time() - iteration_start
             current_frames = batch.numel()

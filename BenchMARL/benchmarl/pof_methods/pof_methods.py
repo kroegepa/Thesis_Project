@@ -196,9 +196,15 @@ def pursuit_grouping(batch):
     return grouping_tensor
 
 
-def grouping_reward_averaging(batch, grouping_tensor):
+def grouping_reward_averaging(batch, grouping_tensor,task_name):
+    if task_name == "pursuit":
+        group_name = "pursuer"
+    elif task_name == "simple_spread":
+        group_name = "agent"
+    else:
+        raise NotImplementedError(f"Task {task_name} not supported for grouping reward averaging.")
     #TODO MAKE IT TASK AGNOSTIC
-    reward = batch["next"]["pursuer"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["next"][group_name]["reward"]  # shape: [B, T, A, 1]
     # Loop over groups 0, 1, 2
     new_reward = reward.clone()
     device = reward.device
@@ -216,7 +222,7 @@ def grouping_reward_averaging(batch, grouping_tensor):
         new_reward[group_mask.bool()] = group_mean.expand_as(new_reward)[group_mask.bool()]
     
     # Save new reward back into batch
-    batch["next"]["pursuer"]["reward"] = new_reward
+    batch["next"][group_name]["reward"] = new_reward
     return batch
 
 def touching_distance(observation,x,y):
