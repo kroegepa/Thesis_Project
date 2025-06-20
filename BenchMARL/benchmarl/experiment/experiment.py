@@ -908,6 +908,8 @@ class Experiment(CallbackNotifier):
 
 
         # Reset policy to prevent bleedover
+        # This looks bad
+        self.algorithm._policies_for_collection = {}
         self.policy = self.algorithm.get_policy_for_collection()
 
         # === Main Training Phase ===

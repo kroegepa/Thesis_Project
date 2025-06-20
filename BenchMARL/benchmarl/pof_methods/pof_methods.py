@@ -97,13 +97,12 @@ def spread_grouping(batch):
 
     for b in range(reward.shape[0]):
         for t in range(reward.shape[1]):
-            rewards_t = reward[b, t, :, 0]  # shape: [A]
-            unique_vals = rewards_t.unique().sort().values  # up to 3 unique rewards
-
-            for g, val in enumerate(unique_vals[:3]):  # up to 3 groups
-                mask = rewards_t == val
-                grouping_tensor[b, t, mask, g] = 1
-
+            reward_vals = []
+            for a in range(reward.shape[2]):
+                if reward[b, t, a, 0] not in reward_vals:
+                    reward_vals.append(reward[b, t, a, 0].item())
+                reward_index = reward_vals.index(reward[b, t, a, 0].item())
+                grouping_tensor[b, t, a, reward_index] = 1
     return grouping_tensor  # shape: [B, T, A, 3]
 
 
