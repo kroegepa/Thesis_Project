@@ -92,7 +92,7 @@ def oracle_grouping(batch, task_name):
         raise NotImplementedError(f"Task {task_name} not supported for oracle grouping.")
 
 def spread_grouping(batch):
-    reward = batch["next"]["agent"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["agent"]["original_reward"]  # shape: [B, T, A, 1]
     grouping_tensor = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
 
     for b in range(reward.shape[0]):
@@ -102,6 +102,8 @@ def spread_grouping(batch):
                 if reward[b, t, a, 0] not in reward_vals:
                     reward_vals.append(reward[b, t, a, 0].item())
                 reward_index = reward_vals.index(reward[b, t, a, 0].item())
+                if reward_index >= 3:
+                    reward_index = 2  # Cap at index 2 for 3 groups
                 grouping_tensor[b, t, a, reward_index] = 1
     return grouping_tensor  # shape: [B, T, A, 3]
 

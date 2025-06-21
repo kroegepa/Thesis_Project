@@ -909,8 +909,17 @@ class Experiment(CallbackNotifier):
 
         # Reset policy to prevent bleedover
         # This looks bad
+        if not self.config.collect_with_grad:
+            iterator = iter(self.collector)
+        else:
+            reset_batch = self.rollout_env.reset()
         self.algorithm._policies_for_collection = {}
-        self.policy = self.algorithm.get_policy_for_collection()
+        self.algorithm._policies_for_loss = {}
+        self._setup_collector()
+        if not self.config.collect_with_grad:
+            iterator = iter(self.collector)
+        else:
+            reset_batch = self.rollout_env.reset()
 
         # === Main Training Phase ===
         for _ in range(warmup_iters, self.config.get_max_n_iters(self.on_policy)):
