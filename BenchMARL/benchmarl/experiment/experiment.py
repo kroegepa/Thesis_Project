@@ -410,7 +410,13 @@ class Experiment(CallbackNotifier):
         self._setup_collector()
         self._setup_logger()
         self._on_setup()
-
+    def _setup_reset(self):
+        self.algorithm._policies_for_collection = {}
+        self.algorithm._policies_for_loss = {}
+        self.algorithm._losses_and_updaters = {}
+        self._setup_task()
+        self._setup_algorithm()
+        self._setup_collector()
     def _perform_checks(self):
         for config in (self.model_config, self.critic_model_config):
             if isinstance(config, SequenceModelConfig):
@@ -908,14 +914,7 @@ class Experiment(CallbackNotifier):
 
 
         # Reset policy to prevent bleedover
-        # This looks bad
-        if not self.config.collect_with_grad:
-            iterator = iter(self.collector)
-        else:
-            reset_batch = self.rollout_env.reset()
-        self.algorithm._policies_for_collection = {}
-        self.algorithm._policies_for_loss = {}
-        self._setup_collector()
+        self._setup_reset()
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
