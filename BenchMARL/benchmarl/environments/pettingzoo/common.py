@@ -85,8 +85,11 @@ class PettingZooClass(TaskClass):
         return False
 
     def has_render(self, env: EnvBase) -> bool:
-        return True
-
+        if self.name not in {
+            "MULTIWALKER",
+        }:
+            return True
+        return False
     def max_steps(self, env: EnvBase) -> int:
         return self.config["max_cycles"]
 
