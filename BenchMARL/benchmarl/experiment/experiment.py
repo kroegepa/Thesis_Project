@@ -957,10 +957,10 @@ class Experiment(CallbackNotifier):
             if self.config.oracle_grouping:
                 # Use oracle grouping if enabled
                 grouping_tensor = oracle_grouping(batch, self.task_name)
-            #else:
-            #    if self.config.train_grouping_no_warmup:
-            #        self.train_grouping_model(batch)
-            #    grouping_tensor = self.predict_grouping(batch)  # Group per timestep
+            else:
+                if self.config.train_grouping_no_warmup:
+                    self.train_grouping_model(batch)
+                grouping_tensor = self.predict_grouping(batch)  # Group per timestep
             if self.config.evaluate_grouping:
                 for group in self.train_group_map.keys():
                     self.logger.log_grouping(

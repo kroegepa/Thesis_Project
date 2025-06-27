@@ -4,13 +4,13 @@ defaults:
 
 task: "pursuit_v4"
 # number of evading entities in environment
-n_evaders: 30
+n_evaders: 60
 # number of pursuing agents in environment
-n_pursuers: 8
+n_pursuers: 16
 # x size of 2d environment
-x_size : 16
+x_size : 23
 # y size of 2d environment
-y_size : 16
+y_size : 23
 # observation range of pursuers
 obs_range : 7
 # number of pursuers needed to catch an evader
