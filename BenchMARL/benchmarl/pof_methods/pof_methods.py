@@ -22,7 +22,7 @@ def pof_transform(batch, task_name):
 
 
 class SpreadGroupingMLP(nn.Module):
-    def __init__(self, obs_dim=30, act_dim=5, hidden_dim=128, num_groups=3):
+    def __init__(self, obs_dim=60, act_dim=5, hidden_dim=128, num_groups=3):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden_dim),
@@ -129,7 +129,35 @@ def fuzzy_grouping(batch, task_name,  n_groups=3):
         raise NotImplementedError(f"Task {task_name} not supported for fuzzy grouping.")
     
 def spread_grouping_fuzzy(batch, n_groups=3):
-    pass
+    """
+    Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
+    Produces one-hot hard assignments (argmax over soft probabilities).
+    
+    Args:
+        batch (TensorDict): contains ["next"]["agent"]["reward"] of shape [B, T, A, 1]
+        n_groups (int): number of clusters to create (default 3)
+        
+    Returns:
+        grouping_tensor: [B, T, A, n_groups] with one-hot group assignments
+    """
+    reward = batch["next"]["agent"]["reward"]  # shape: [B, T, A, 1]
+    B, T, A, _ = reward.shape
+
+    # Flatten to [N, 1]
+    rewards_np = reward.view(-1, 1).detach().cpu().numpy()
+
+    # Fit GMM on all rewards in batch
+    gmm = GaussianMixture(n_components=n_groups, covariance_type="full", random_state=0)
+    gmm.fit(rewards_np)
+
+    # Predict group (hard assignment)
+    group_ids = gmm.predict(rewards_np)  # shape: [N]
+
+    # Convert to one-hot
+    group_tensor = torch.nn.functional.one_hot(torch.tensor(group_ids), num_classes=n_groups).float()  # [N, n_groups]
+    grouping_tensor = group_tensor.view(B, T, A, n_groups).to(reward.device)
+
+    return grouping_tensor
 def pursuit_grouping_fuzzy(batch, n_groups=3):
     """
     Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
@@ -226,6 +254,8 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name):
     batch["next"][group_name]["reward"] = new_reward
     return batch
 
+
+#DEPRECATED
 def touching_distance(observation,x,y):
     #Hardcoded for obs size = 7 for now
     for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (0,0)]:

@@ -706,14 +706,16 @@ class Experiment(CallbackNotifier):
         elif self.task_name == "simple_spread":
             obs_list, act_list, label_list = [], [], []
 
-            obs = batch["agent"]["observation"]  # [B, T, A, 30]
+            obs = batch["agent"]["observation"]  # [B, T, A, 30] (30 depends on number of agents)
             act = batch["agent"]["action"]       # [B, T, A, 5]
-            reward = batch["next"]["agent"]["reward"]  
-            group = spread_grouping(batch)
-            act_dim = 5 
+            if self.config.train_grouping_no_warmup:
+                group = fuzzy_grouping(batch, self.task_name)
+            else:
+                group = oracle_grouping(batch, self.task_name)
+            act_dim = 5
             #   obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
             act_list.append(act.reshape(-1, act_dim))            
-            obs_list.append(obs.reshape(-1, 30))
+            obs_list.append(obs.reshape(-1, 60))
             label_list.append(group.argmax(dim=-1).view(-1))
 
         obs_tensor = torch.cat(obs_list, dim=0)
@@ -829,7 +831,7 @@ class Experiment(CallbackNotifier):
 
             # Reshape correctly
             B, T, A = obs.shape[:3]
-            obs = obs.reshape(-1, 30)
+            obs = obs.reshape(-1, 60)
             # One-hot encode actions
             act_dim = 5
             act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]
