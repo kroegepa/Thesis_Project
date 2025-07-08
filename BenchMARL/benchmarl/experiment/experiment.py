@@ -715,7 +715,7 @@ class Experiment(CallbackNotifier):
             act_dim = 5
             #   obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
             act_list.append(act.reshape(-1, act_dim))            
-            obs_list.append(obs.reshape(-1, 60))
+            obs_list.append(obs.reshape(-1, 48))
             label_list.append(group.argmax(dim=-1).view(-1))
 
         obs_tensor = torch.cat(obs_list, dim=0)
@@ -831,7 +831,7 @@ class Experiment(CallbackNotifier):
 
             # Reshape correctly
             B, T, A = obs.shape[:3]
-            obs = obs.reshape(-1, 60)
+            obs = obs.reshape(-1, 48)
             # One-hot encode actions
             act_dim = 5
             act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]

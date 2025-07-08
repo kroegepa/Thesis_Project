@@ -5,5 +5,5 @@ defaults:
 
 task: "simple_spread_v3"
 max_cycles: 100
-N: 10
+N: 8
 local_ratio: 0.5
