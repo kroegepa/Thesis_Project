@@ -91,21 +91,23 @@ def oracle_grouping(batch, task_name):
     else:
         raise NotImplementedError(f"Task {task_name} not supported for oracle grouping.")
 
-def spread_grouping(batch):
+def spread_grouping(batch, n_groups=3):
     reward = batch["agent"]["original_reward"]  # shape: [B, T, A, 1]
-    grouping_tensor = torch.zeros((*reward.shape[:-1], 3), dtype=torch.float32)
+    B, T, A, _ = reward.shape
+    rewards_np = reward.view(-1, 1).detach().cpu().numpy()
 
-    for b in range(reward.shape[0]):
-        for t in range(reward.shape[1]):
-            reward_vals = []
-            for a in range(reward.shape[2]):
-                if reward[b, t, a, 0] not in reward_vals:
-                    reward_vals.append(reward[b, t, a, 0].item())
-                reward_index = reward_vals.index(reward[b, t, a, 0].item())
-                if reward_index >= 3:
-                    reward_index = 2  # Cap at index 2 for 3 groups
-                grouping_tensor[b, t, a, reward_index] = 1
-    return grouping_tensor  # shape: [B, T, A, 3]
+    # Fit GMM on all rewards in batch
+    gmm = GaussianMixture(n_components=n_groups, covariance_type="full", random_state=0)
+    gmm.fit(rewards_np)
+
+    # Predict group (hard assignment)
+    group_ids = gmm.predict(rewards_np)  # shape: [N]
+
+    # Convert to one-hot
+    group_tensor = torch.nn.functional.one_hot(torch.tensor(group_ids), num_classes=n_groups).float()  # [N, n_groups]
+    grouping_tensor = group_tensor.view(B, T, A, n_groups).to(reward.device)
+
+    return grouping_tensor
 
 
 def fuzzy_grouping(batch, task_name,  n_groups=3):
@@ -158,6 +160,7 @@ def spread_grouping_fuzzy(batch, n_groups=3):
     grouping_tensor = group_tensor.view(B, T, A, n_groups).to(reward.device)
 
     return grouping_tensor
+
 def pursuit_grouping_fuzzy(batch, n_groups=3):
     """
     Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
