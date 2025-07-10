@@ -22,7 +22,7 @@ def pof_transform(batch, task_name):
 
 
 class SpreadGroupingMLP(nn.Module):
-    def __init__(self, obs_dim=48, act_dim=5, hidden_dim=128, num_groups=3):
+    def __init__(self, obs_dim, act_dim=5, hidden_dim=128, num_groups=3):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden_dim),

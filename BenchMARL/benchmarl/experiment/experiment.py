@@ -705,8 +705,9 @@ class Experiment(CallbackNotifier):
             label_list.append(group.argmax(dim=-1).view(-1))
         elif self.task_name == "simple_spread":
             obs_list, act_list, label_list = [], [], []
+            obs_size = self.task.config['N'] * 6
 
-            obs = batch["agent"]["observation"]  # [B, T, A, 30] (30 depends on number of agents)
+            obs = batch["agent"]["observation"]  # [B, T, A, obs_size]
             act = batch["agent"]["action"]       # [B, T, A, 5]
             if self.config.train_grouping_no_warmup:
                 group = fuzzy_grouping(batch, self.task_name)
@@ -715,7 +716,7 @@ class Experiment(CallbackNotifier):
             act_dim = 5
             #   obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
             act_list.append(act.reshape(-1, act_dim))            
-            obs_list.append(obs.reshape(-1, 48))
+            obs_list.append(obs.reshape(-1, obs_size))
             label_list.append(group.argmax(dim=-1).view(-1))
 
         obs_tensor = torch.cat(obs_list, dim=0)
@@ -826,12 +827,13 @@ class Experiment(CallbackNotifier):
             act_dim = 5
             act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
         if self.task_name == "simple_spread":
-            obs = batch["agent"]["observation"]  # [B, T, A, 30]
+            obs_size = self.task.config['N'] * 6
+            obs = batch["agent"]["observation"]  # [B, T, A, obs_size]
             act = batch["agent"]["action"]       # [B, T, A, 5] (continuous)
 
             # Reshape correctly
             B, T, A = obs.shape[:3]
-            obs = obs.reshape(-1, 48)
+            obs = obs.reshape(-1, obs_size)
             # One-hot encode actions
             act_dim = 5
             act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]
@@ -860,7 +862,8 @@ class Experiment(CallbackNotifier):
         if self.task_name == "pursuit":
             self.grouping_model = PursuitGroupingCNN().to(self.config.train_device)
         if self.task_name == "simple_spread":
-            self.grouping_model = SpreadGroupingMLP().to(self.config.train_device)
+            obs_size = self.task.config['N'] * 6
+            self.grouping_model = SpreadGroupingMLP(obs_size).to(self.config.train_device)
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
