@@ -18,7 +18,8 @@ import torchrl
 
 from tensordict import TensorDictBase
 from torch import Tensor
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, adjusted_rand_score, normalized_mutual_info_score, confusion_matrix
+from scipy.optimize import linear_sum_assignment
 
 from torchrl.record import TensorboardLogger
 from torchrl.record.loggers import get_logger
@@ -172,30 +173,40 @@ class Logger:
     
     def log_grouping(self, group: str, oracle_labels: torch.Tensor, predicted_labels: torch.Tensor, step: int):
 
-      #TODO: Extend for different groups present
-      # Ensure inputs are on CPU and flattened
-      y_true = oracle_labels.argmax(dim=-1).view(-1).cpu().numpy()
-      y_pred = predicted_labels.argmax(dim=-1).view(-1).cpu().numpy()
-      
-      labels=[i for i in range(oracle_labels.shape[-1])]
-      precision_weighted = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
-      recall_weighted = recall_score(y_true, y_pred, average='weighted', labels=labels, zero_division=0)
-      f1_weighted = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
+        #TODO: Extend for different groups present
+        # Ensure inputs are on CPU and flattened
+        y_true = oracle_labels.argmax(dim=-1).view(-1).cpu().numpy()
+        y_pred = predicted_labels.argmax(dim=-1).view(-1).cpu().numpy()
+        
+        labels=[i for i in range(oracle_labels.shape[-1])]
+        precision_weighted = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
+        recall_weighted = recall_score(y_true, y_pred, average='weighted', labels=labels, zero_division=0)
+        f1_weighted = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
 
-      precision_macro = precision_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
-      recall_macro = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
-      f1_macro = f1_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)  
+        precision_macro = precision_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
+        recall_macro = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
+        f1_macro = f1_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)  
 
-      to_log = {
-          f"grouping/{group}/precision_weighted": precision_weighted,
-          f"grouping/{group}/recall_weighted": recall_weighted,
-          f"grouping/{group}/f1_score_weighted": f1_weighted,
-          f"grouping/{group}/precision_macro": precision_macro,
-          f"grouping/{group}/recall_macro": recall_macro,
-          f"grouping/{group}/f1_score_macro": f1_macro,
-      }
+        cm = confusion_matrix(y_true, y_pred)
+        row_ind, col_ind = linear_sum_assignment(-cm)
+        clustering_accuracy = cm[row_ind, col_ind].sum() / cm.sum()
+        ari = adjusted_rand_score(y_true, y_pred)
+        nmi = normalized_mutual_info_score(y_true, y_pred)
+        
 
-      self.log(to_log, step=step)
+        to_log = {
+            f"grouping/{group}/precision_weighted": precision_weighted,
+            f"grouping/{group}/recall_weighted": recall_weighted,
+            f"grouping/{group}/f1_score_weighted": f1_weighted,
+            f"grouping/{group}/precision_macro": precision_macro,
+            f"grouping/{group}/recall_macro": recall_macro,
+            f"grouping/{group}/f1_score_macro": f1_macro,
+            f"grouping/{group}/clustering_accuracy": clustering_accuracy,
+            f"grouping/{group}/adjusted_rand_index": ari,
+            f"grouping/{group}/normalized_mutual_info": nmi,
+        }
+
+        self.log(to_log, step=step)
 
     def log_training(self, group: str, training_td: TensorDictBase, step: int):
         if not len(self.loggers):
