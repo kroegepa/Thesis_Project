@@ -69,7 +69,7 @@ max_n_frames: 1_500_000
 
 train_grouping_no_warmup: False
 train_grouping_warmup: False
-warmup_iters: 10
+warmup_iters: 50
 
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 6000
