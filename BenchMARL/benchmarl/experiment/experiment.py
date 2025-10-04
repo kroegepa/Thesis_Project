@@ -926,7 +926,7 @@ class Experiment(CallbackNotifier):
             reset_batch = self.rollout_env.reset()
 
         # === Main Training Phase ===
-        for _ in range(warmup_iters, self.config.get_max_n_iters(self.on_policy)):
+        for _ in range(self.config.get_max_n_iters(self.on_policy)):
             iteration_start = time.time()
 
             if not self.config.collect_with_grad:
