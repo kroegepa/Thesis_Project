@@ -36,7 +36,7 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP, fuzzy_grouping
+from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP, fuzzy_grouping, AdversarialPursuitPredatorCNN
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -718,7 +718,23 @@ class Experiment(CallbackNotifier):
             act_list.append(act.reshape(-1, act_dim))            
             obs_list.append(obs.reshape(-1, obs_size))
             label_list.append(group.argmax(dim=-1).view(-1))
-
+        elif self.task_name =="adversarial_pursuit":
+            obs_list, act_list, label_list = [], [], []
+            obs = batch["predator"]["observation"]  # [B, T, A, 10, 10, 5]
+            act = batch["predator"]["action"]       # [B, T, A]  (discrete)
+            if self.config.train_grouping_no_warmup:
+                group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
+            else:
+                group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
+            # Reshape correctly
+            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+            obs = obs.reshape(-1, 5, 10, 10)
+            # One-hot encode actions
+            act_dim = 13
+            act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
+            act_list.append(act_onehot)
+            obs_list.append(obs)
+            label_list.append(group.argmax(dim=-1).view(-1))
         obs_tensor = torch.cat(obs_list, dim=0)
         act_tensor = torch.cat(act_list, dim=0)
         label_tensor = torch.cat(label_list, dim=0)
@@ -736,7 +752,6 @@ class Experiment(CallbackNotifier):
                 obs_b = obs_b.to(device)
                 act_b = act_b.to(device)
                 label_b = label_b.to(device)
-
                 optimizer.zero_grad()
                 logits = self.grouping_model(obs_b, act_b)
                 loss = criterion(logits, label_b)
@@ -837,6 +852,17 @@ class Experiment(CallbackNotifier):
             # One-hot encode actions
             act_dim = 5
             act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]
+        if self.task_name == "adversarial_pursuit":
+            obs = batch["predator"]["observation"]  # [B, T, A, 10, 10, 5]
+            act = batch["predator"]["action"]       # [B, T, A]  (discrete)
+
+            # Reshape correctly
+            B, T, A = obs.shape[:3]
+            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
+            obs = obs.reshape(-1, 5, 10, 10)
+            # One-hot encode actions
+            act_dim = 13
+            act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
         # Run model
         with torch.no_grad():
             logits = self.grouping_model(obs, act)  # [B*T*A, 3]
@@ -864,6 +890,8 @@ class Experiment(CallbackNotifier):
         if self.task_name == "simple_spread":
             obs_size = self.task.config['N'] * 6
             self.grouping_model = SpreadGroupingMLP(obs_size).to(self.config.train_device)
+        if self.task_name == "adversarial_pursuit":
+            self.grouping_model = AdversarialPursuitPredatorCNN().to(self.config.train_device)
         if not self.config.collect_with_grad:
             iterator = iter(self.collector)
         else:
