@@ -66,7 +66,49 @@ class PursuitGroupingCNN(nn.Module):
         x = self.conv(obs_grid)
         x = torch.cat([x, action], dim=-1)
         return self.fc(x)  # [N, num_classes]
-    
+class BattleBlueCNN(nn.Module):
+    def __init__(self, action_dim=21, num_classes=3):
+        super().__init__()
+        
+        # Input observation channels = 5, local grid size = 13x13
+        self.conv = nn.Sequential(
+            # Layer 1: 13x13x5 -> 13x13x32 (padding=1 preserves dimensions)
+            nn.Conv2d(in_channels=5, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            
+            # Layer 2: 13x13x32 -> 11x11x64 (padding=0 drops 2 pixels off H/W)
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=0),
+            nn.ReLU(),
+            
+            # Layer 3: 11x11x64 -> 9x9x64 (padding=0 drops another 2 pixels)
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=0),
+            nn.ReLU(),
+            
+            # Flatten layer: 9 * 9 * 64 = 5184 features
+            nn.Flatten()
+        )
+        
+        # Fully connected head
+        # Adjusted flattened input size from 2304 to 5184
+        self.fc = nn.Sequential(
+            nn.Linear(5184 + action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, obs, action):
+        """
+        Handles both channel-last format [Batch, 13, 13, 5] 
+        and PyTorch channel-first format [Batch, 5, 13, 13]
+        """
+        # If channels are at the end (H, W, C), permute to (C, H, W)
+        if obs.shape[-1] == 5:
+            obs = obs.permute(0, 3, 1, 2)  # [B, 13, 13, 5] -> [B, 5, 13, 13]
+            
+        features = self.conv(obs)
+        features = torch.cat([features, action], dim=-1)
+        logits = self.fc(features)
+        return logits
 class AdversarialPursuitPredatorCNN(nn.Module):
     def __init__(self, action_dim=13, num_classes=3):
         super().__init__()
@@ -133,7 +175,7 @@ def oracle_grouping(batch, task_name):
         return spread_grouping(batch)
     elif task_name == "adversarial_pursuit":
         return adv_pursuit_grouping(batch)
-    elif task_name == "magent_battle":
+    elif task_name == "battle":
         return battle_grouping(batch)
     else:
         raise NotImplementedError(f"Task {task_name} not supported for oracle grouping.")
@@ -157,7 +199,23 @@ def spread_grouping(batch, n_groups=3):
     return grouping_tensor
 
 def battle_grouping(batch, n_groups=3):
-    pass
+    reward = batch["blue"]["original_reward"]  # shape: [B, T, A, 1]
+    grouping_tensor = torch.zeros((*reward.shape[:-1],3),dtype=torch.float32)
+    #Just time dimension
+    #max_group_vector = torch.zeros(reward.shape[1])
+    #Use batch size from batch object here instead?
+
+    #Perfect grouping by reward signal
+    for b in range(reward.shape[0]):
+        for t in range(reward.shape[1]):
+            for a in range(reward.shape[2]):
+                if reward[b,t,a,0] >= 1:  # Threshold for grouping
+                    grouping_tensor[b,t,a,2] = 1
+                elif reward[b,t,a,0] >= 0:  # Threshold for grouping
+                    grouping_tensor[b,t,a,1] = 1
+                else:
+                    grouping_tensor[b,t,a,0] = 1
+    return grouping_tensor
 
 def adv_pursuit_grouping(batch, n_groups=3):
     reward = batch["predator"]["original_reward"]  # shape: [B, T, A, 1]
@@ -197,6 +255,8 @@ def fuzzy_grouping(batch, task_name,  n_groups=3):
         return spread_grouping_fuzzy(batch, n_groups)
     if task_name == "adversarial_pursuit":
         return adv_pursuit_grouping_fuzzy(batch, n_groups)
+    if task_name == "battle":
+        return battle_grouping_fuzzy(batch, n_groups)
     else:
         raise NotImplementedError(f"Task {task_name} not supported for fuzzy grouping.")
 
@@ -213,6 +273,37 @@ def adv_pursuit_grouping_fuzzy(batch, n_groups=3):
         grouping_tensor: [B, T, A, n_groups] with one-hot group assignments
     """
     reward = batch["next"]["predator"]["reward"]  # shape: [B, T, A, 1]
+    B, T, A, _ = reward.shape
+
+    # Flatten to [N, 1]
+    rewards_np = reward.view(-1, 1).detach().cpu().numpy()
+
+    # Fit GMM on all rewards in batch
+    gmm = GaussianMixture(n_components=n_groups, covariance_type="full", random_state=0)
+    gmm.fit(rewards_np)
+
+    # Predict group (hard assignment)
+    group_ids = gmm.predict(rewards_np)  # shape: [N]
+
+    # Convert to one-hot
+    group_tensor = torch.nn.functional.one_hot(torch.tensor(group_ids), num_classes=n_groups).float()  # [N, n_groups]
+    grouping_tensor = group_tensor.view(B, T, A, n_groups).to(reward.device)
+
+    return grouping_tensor
+
+def battle_grouping_fuzzy(batch, n_groups=3):
+    """
+    Generate grouping tensor using a Gaussian Mixture Model fit on the noisy reward signal.
+    Produces one-hot hard assignments (argmax over soft probabilities).
+    
+    Args:
+        batch (TensorDict): contains ["next"]["pursuer"]["reward"] of shape [B, T, A, 1]
+        n_groups (int): number of clusters to create (default 3)
+        
+    Returns:
+        grouping_tensor: [B, T, A, n_groups] with one-hot group assignments
+    """
+    reward = batch["next"]["blue"]["reward"]  # shape: [B, T, A, 1]
     B, T, A, _ = reward.shape
 
     # Flatten to [N, 1]
@@ -336,6 +427,8 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name):
         group_name = "agent"
     elif task_name == "adversarial_pursuit":
         group_name = "predator"
+    elif task_name == "battle":
+        group_name = "blue"
     else:
         raise NotImplementedError(f"Task {task_name} not supported for grouping reward averaging.")
     #TODO MAKE IT TASK AGNOSTIC
@@ -359,7 +452,6 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name):
     # Save new reward back into batch
     batch["next"][group_name]["reward"] = new_reward
     return batch
-
 
 #DEPRECATED
 def touching_distance(observation,x,y):

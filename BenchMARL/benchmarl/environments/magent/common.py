@@ -23,13 +23,17 @@ class MAgentClass(TaskClass):
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
+        if self.name == "BATTLE":
+            mask = True
+        else:
+            mask = False
 
         return lambda: PettingZooWrapper(
             env=self.__get_env(config),
             return_state=True,
             seed=seed,
             done_on_any=False,
-            use_mask=False,
+            use_mask=mask,
             device=device,
         )
 
@@ -37,7 +41,7 @@ class MAgentClass(TaskClass):
         try:
             from magent2.environments import (
                 adversarial_pursuit_v4,
-                # battle_v4,
+                battle_v4,
                 # battlefield_v5,
                 # combined_arms_v6,
                 # gather_v5,
@@ -50,7 +54,7 @@ class MAgentClass(TaskClass):
 
         envs = {
             "ADVERSARIAL_PURSUIT": adversarial_pursuit_v4,
-            # "BATTLE": battle_v4,
+            "BATTLE": battle_v4,
             # "BATTLEFIELD": battlefield_v5,
             # "COMBINED_ARMS": combined_arms_v6,
             # "GATHER": gather_v5,
@@ -127,7 +131,7 @@ class MAgentTask(Task):
     """Enum for MAgent2 tasks."""
 
     ADVERSARIAL_PURSUIT = None
-    # BATTLE = None
+    BATTLE = None
     # BATTLEFIELD = None
     # COMBINED_ARMS = None
     # GATHER = None
