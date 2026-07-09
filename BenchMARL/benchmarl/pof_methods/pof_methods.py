@@ -228,7 +228,7 @@ def adv_pursuit_grouping(batch, n_groups=3):
     for b in range(reward.shape[0]):
         for t in range(reward.shape[1]):
             for a in range(reward.shape[2]):
-                if reward[b,t,a,0] >= 1:  # Threshold for grouping
+                if reward[b,t,a,0] >= 0.8:  # Threshold for grouping
                     grouping_tensor[b,t,a,2] = 1
                 elif reward[b,t,a,0] >= 0:  # Threshold for grouping
                     grouping_tensor[b,t,a,1] = 1
