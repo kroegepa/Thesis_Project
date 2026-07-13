@@ -454,9 +454,16 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name, noise_fam="norma
     # Loop over groups 0, 1, 2
     new_reward = reward.clone()
     device = reward.device
+    if "mask" in batch[group_name]:
+        alive_mask = batch[group_name]["mask"].unsqueeze(-1).float().to(device) # [B, T, A, 1]
+    else:
+        # Fallback if the mask isn't populated (e.g. simple_spread where agents don't die)
+        alive_mask = torch.ones_like(reward)
+    
     for g in range(grouping_tensor.shape[-1]):
         # Create mask for group g: shape [B, T, A, 1]
         group_mask = (grouping_tensor[..., g] == 1).unsqueeze(-1).float().to(device)  # shape: [B, T, A, 1]
+        goup_mask = group_mask * alive_mask
         if noise_fam == "normal":
             # Compute sum and count for averaging
             group_sum = (reward * group_mask).sum(dim=2, keepdim=True)  # sum over agents
