@@ -168,9 +168,9 @@ def calc_agent_position(observation_size):
     #I think this is only right for uneven observation sizes
     return (observation_size // 2) + 1
 
-def oracle_grouping(batch, task_name):
+def oracle_grouping(batch, task_name, num_groups=3):
     if task_name == "pursuit":
-        return pursuit_grouping(batch)
+        return pursuit_grouping(batch, num_groups)
     elif task_name == "simple_spread":
         return spread_grouping(batch)
     elif task_name == "adversarial_pursuit":
@@ -385,7 +385,7 @@ def pursuit_grouping_fuzzy(batch, n_groups=3):
     return grouping_tensor
 
 
-def pursuit_grouping(batch):
+def pursuit_grouping(batch, n_groups=3):
     # Placeholder: determine which agents are near an evader based on obs and action
     #Batch Time and agent dimension
     #obs = batch["pursuer"]["observation"]  # shape: [B, T, A, obs_dim]
@@ -396,17 +396,35 @@ def pursuit_grouping(batch):
     #max_group_vector = torch.zeros(reward.shape[1])
     #Use batch size from batch object here instead?
 
-    #Perfect grouping by reward signal
-    for b in range(reward.shape[0]):
-        for t in range(reward.shape[1]):
-            for a in range(reward.shape[2]):
-                if reward[b,t,a,0] > 2:  # Threshold for grouping
-                    grouping_tensor[b,t,a,2] = 1
-                elif reward[b,t,a,0] > -0.1:  # Threshold for grouping
-                    grouping_tensor[b,t,a,1] = 1
-                else:
+    if n_groups == 3:
+        #Perfect grouping by reward signal
+        for b in range(reward.shape[0]):
+            for t in range(reward.shape[1]):
+                for a in range(reward.shape[2]):
+                    if reward[b,t,a,0] > 2:  # Threshold for grouping
+                        grouping_tensor[b,t,a,2] = 1
+                    elif reward[b,t,a,0] > -0.1:  # Threshold for grouping
+                        grouping_tensor[b,t,a,1] = 1
+                    else:
+                        grouping_tensor[b,t,a,0] = 1
+        return grouping_tensor
+    if n_groups == 2:
+        #Perfect grouping by reward signal
+        for b in range(reward.shape[0]):
+            for t in range(reward.shape[1]):
+                for a in range(reward.shape[2]):
+                    if reward[b,t,a,0] > -0.1:  # Threshold for grouping
+                        grouping_tensor[b,t,a,1] = 1
+                    else:
+                        grouping_tensor[b,t,a,0] = 1
+        return grouping_tensor        
+    else:
+                #Perfect grouping by reward signal
+        for b in range(reward.shape[0]):
+            for t in range(reward.shape[1]):
+                for a in range(reward.shape[2]):
                     grouping_tensor[b,t,a,0] = 1
-    return grouping_tensor
+        return grouping_tensor
     #Simple Heuristic
     agent_position = calc_agent_position(obs.shape[3])
     for b in range(reward.shape[0]):
@@ -420,7 +438,7 @@ def pursuit_grouping(batch):
     return grouping_tensor
 
 
-def grouping_reward_averaging(batch, grouping_tensor,task_name):
+def grouping_reward_averaging(batch, grouping_tensor,task_name, noise_fam="normal"):
     if task_name == "pursuit":
         group_name = "pursuer"
     elif task_name == "simple_spread":
@@ -439,13 +457,22 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name):
     for g in range(grouping_tensor.shape[-1]):
         # Create mask for group g: shape [B, T, A, 1]
         group_mask = (grouping_tensor[..., g] == 1).unsqueeze(-1).float().to(device)  # shape: [B, T, A, 1]
+        if noise_fam == "normal":
+            # Compute sum and count for averaging
+            group_sum = (reward * group_mask).sum(dim=2, keepdim=True)  # sum over agents
+            group_count = group_mask.sum(dim=2, keepdim=True).clamp(min=1)  # avoid divide-by-zero
 
-        # Compute sum and count for averaging
-        group_sum = (reward * group_mask).sum(dim=2, keepdim=True)  # sum over agents
-        group_count = group_mask.sum(dim=2, keepdim=True).clamp(min=1)  # avoid divide-by-zero
-
-        group_mean = group_sum / group_count  # shape: [B, T, 1, 1]
-
+            group_mean = group_sum / group_count  # shape: [B, T, 1, 1]
+        else:
+            masked_reward = torch.where(group_mask.bool(), reward, torch.tensor(float('nan'), device=device))
+            
+            # Compute the median along the Agent dimension (dim=2)
+            # nanmedian returns a named tuple: (values, indices)
+            group_median = torch.nanmedian(masked_reward, dim=2, keepdim=True).values  # shape: [B, T, 1, 1]
+            
+            # If an entire group is empty at a timestep, nanmedian returns NaN. 
+            # We replace NaN with 0 to prevent downstream gradient corruption.
+            group_mean = torch.where(torch.isnan(group_median), torch.zeros_like(group_median), group_median)
         # Assign average back to each agent in group
         new_reward[group_mask.bool()] = group_mean.expand_as(new_reward)[group_mask.bool()]
     

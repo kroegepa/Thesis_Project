@@ -92,6 +92,7 @@ class ExperimentConfig:
     pof_enable: bool = MISSING
     oracle_grouping: bool = MISSING
     evaluate_grouping: bool = MISSING
+    num_groups: int = MISSING
 
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
@@ -807,32 +808,35 @@ class Experiment(CallbackNotifier):
         elif perturbation_type == "bernoulli":
             done = batch.get("done")
             for group in self.group_map.keys():
-                # 1. Get the reward
+                # 1. Get the true reward
                 reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
 
-                # 2. Create a mask of ±1 based on flip probability
-                flip_mask = torch.bernoulli(torch.full_like(reward, flip_prob))
-                flip_mask = 1.0 - 2.0 * flip_mask  # 0 -> +1, 1 -> -1
+                # 2. Determine WHICH steps/agents get attacked (e.g., flip_prob = 0.15 for a 15% attack rate)
+                attack_mask = torch.bernoulli(torch.full_like(reward, flip_prob)) # 1 if attacked, 0 if safe
 
-                # 3. Apply flipping
-                reward_flipped = reward * flip_mask
+                # 3. Create the extreme outlier values (+10 or -10 randomly)
+                sign_flip = torch.bernoulli(torch.full_like(reward, 0.5)) # 50/50 chance of + or -
+                outlier_values = 10.0 * (1.0 - 2.0 * sign_flip) # Overwrites to +10.0 or -10.0
 
-                # 4. Set flipped reward back
-                batch.get("next").get(group).set("reward", reward_flipped)
+                # 4. Mix the clean reward with the adversarial outliers
+                # If attack_mask is 1, take outlier_values. If 0, keep true reward.
+                reward_perturbed = (attack_mask * outlier_values) + ((1.0 - attack_mask) * reward)
 
-                # 5. Recompute episode_reward
-                episode_reward = torch.zeros_like(reward_flipped)
-                cumulative = torch.zeros_like(reward_flipped[:, 0])  # [B, A, 1]
+                # 5. Set perturbed reward back
+                batch.get("next").get(group).set("reward", reward_perturbed)
+
+                # 6. Recompute cumulative episode_reward with reset at done
+                episode_reward = torch.zeros_like(reward_perturbed)
+                cumulative = torch.zeros_like(reward_perturbed[:, 0])  # [B, A, 1]
                 done_broadcast = done.unsqueeze(2).expand(-1, -1, reward.shape[2], -1)
 
-                for t in range(reward_flipped.shape[1]):
-                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_flipped[:, t]
+                for t in range(reward_perturbed.shape[1]):
+                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_perturbed[:, t]
                     episode_reward[:, t] = cumulative
 
-                # 6. Store recomputed episode_reward
+                # 7. Store recomputed episode_reward
                 batch.get("next").get(group).set("episode_reward", episode_reward)
                 batch.get(group).set("episode_reward", episode_reward)
-
         #Under construction
         elif perturbation_type == "uniform":
             batch.get("next").get("pursuer").set("reward", torch.zeros_like(batch.get("next").get("pursuer").get("reward")))
@@ -1019,7 +1023,7 @@ class Experiment(CallbackNotifier):
                  )
             if self.config.oracle_grouping:
                 # Use oracle grouping if enabled
-                grouping_tensor = oracle_grouping(batch, self.task_name)
+                grouping_tensor = oracle_grouping(batch, self.task_name, self.config.num_groups)
             else:
                 if self.config.train_grouping_no_warmup:
                     self.train_grouping_model(batch)
@@ -1035,7 +1039,7 @@ class Experiment(CallbackNotifier):
 
 
             if self.config.pof_enable:
-                batch = grouping_reward_averaging(batch, grouping_tensor, self.task_name)
+                batch = grouping_reward_averaging(batch, grouping_tensor, self.task_name, self.config.reward_perturbation_type)
 
             collection_time = time.time() - iteration_start
             current_frames = batch.numel()

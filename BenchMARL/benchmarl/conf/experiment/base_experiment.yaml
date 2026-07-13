@@ -45,7 +45,7 @@ reward_perturbation_type: "normal"
 # The reward attack standard deviation, relevant for gaussian
 reward_perturbation_stdev: 0.5
 # The reward flip probability, relevant for bernoulli
-reward_perturbation_flip_prob: 0.1
+reward_perturbation_flip_prob: 0.2
 
 #Whether to include power of friendship(pfo) reward robustness mechanism
 pof_enable: False
@@ -53,6 +53,8 @@ pof_enable: False
 oracle_grouping: False
 #Whether to evaluate the grouping
 evaluate_grouping: False
+#Number of groups
+num_groups: 3
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
