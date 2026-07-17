@@ -738,8 +738,8 @@ class Experiment(CallbackNotifier):
             label_list.append(group.argmax(dim=-1).view(-1))
         elif self.task_name =="battle":
             obs_list, act_list, label_list = [], [], []
-            obs = batch["blue"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["blue"]["action"]       # [B, T, A]  (discrete)
+            obs = batch["red"]["observation"]  # [B, T, A, 10, 10, 5]
+            act = batch["red"]["action"]       # [B, T, A]  (discrete)
             if self.config.train_grouping_no_warmup:
                 group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
             else:
@@ -885,8 +885,8 @@ class Experiment(CallbackNotifier):
             act_dim = 13
             act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
         if self.task_name == "battle":
-            obs = batch["blue"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["blue"]["action"]       # [B, T, A]  (discrete)
+            obs = batch["red"]["observation"]  # [B, T, A, 10, 10, 5]
+            act = batch["red"]["action"]       # [B, T, A]  (discrete)
 
             # Reshape correctly
             B, T, A = obs.shape[:3]

@@ -199,7 +199,7 @@ def spread_grouping(batch, n_groups=3):
     return grouping_tensor
 
 def battle_grouping(batch, n_groups=3):
-    reward = batch["blue"]["original_reward"]  # shape: [B, T, A, 1]
+    reward = batch["red"]["original_reward"]  # shape: [B, T, A, 1]
     grouping_tensor = torch.zeros((*reward.shape[:-1],3),dtype=torch.float32)
     #Just time dimension
     #max_group_vector = torch.zeros(reward.shape[1])
@@ -303,7 +303,7 @@ def battle_grouping_fuzzy(batch, n_groups=3):
     Returns:
         grouping_tensor: [B, T, A, n_groups] with one-hot group assignments
     """
-    reward = batch["next"]["blue"]["reward"]  # shape: [B, T, A, 1]
+    reward = batch["next"]["red"]["reward"]  # shape: [B, T, A, 1]
     B, T, A, _ = reward.shape
 
     # Flatten to [N, 1]
@@ -446,7 +446,7 @@ def grouping_reward_averaging(batch, grouping_tensor,task_name, noise_fam="norma
     elif task_name == "adversarial_pursuit":
         group_name = "predator"
     elif task_name == "battle":
-        group_name = "blue"
+        group_name = "red"
     else:
         raise NotImplementedError(f"Task {task_name} not supported for grouping reward averaging.")
     #TODO MAKE IT TASK AGNOSTIC
