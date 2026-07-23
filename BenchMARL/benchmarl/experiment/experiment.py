@@ -816,7 +816,7 @@ class Experiment(CallbackNotifier):
 
                 # 3. Create the extreme outlier values (+10 or -10 randomly)
                 sign_flip = torch.bernoulli(torch.full_like(reward, 0.5)) # 50/50 chance of + or -
-                outlier_values = 10.0 * (1.0 - 2.0 * sign_flip) # Overwrites to +10.0 or -10.0
+                outlier_values = 3.0 * (1.0 - 2.0 * sign_flip) # Overwrites to +10.0 or -10.0
 
                 # 4. Mix the clean reward with the adversarial outliers
                 # If attack_mask is 1, take outlier_values. If 0, keep true reward.
