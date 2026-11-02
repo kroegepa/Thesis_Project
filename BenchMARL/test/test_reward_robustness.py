@@ -24,6 +24,7 @@ from benchmarl.reward_robustness.groupers import (
 )
 from benchmarl.reward_robustness.metrics import (
     adjusted_rand_index,
+    event_contrast_sums,
     pairwise_grouping_scores,
     reward_error_metrics,
 )
@@ -144,6 +145,15 @@ class TestMetrics:
         assert s["pair_recall"] == 1.0
         assert s["pair_precision"] == pytest.approx(4 / 12)
         assert s["mean_group_size"] == pytest.approx(4.0)
+
+    def test_event_contrast(self):
+        true = torch.tensor([[5.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+        event = true > 1
+        num, den, rows = event_contrast_sums(true, true, event)
+        assert rows == 1 and num / den == pytest.approx(1.0)
+        shared = group_mean(true, torch.zeros_like(true, dtype=torch.long), torch.ones_like(event))
+        num, den, _ = event_contrast_sums(true, shared, event)
+        assert num / den == pytest.approx(0.0)
 
     def test_reward_error_levels(self):
         true = torch.tensor([0.0, 0.0, 5.0])

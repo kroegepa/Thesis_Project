@@ -176,7 +176,12 @@ class RewardRobustness:
     ) -> Dict[str, float]:
         truth = oracle_labels(data.true_reward, self.spec, self.config.num_groups, data.mask)
         logs = reward_error_metrics(
-            data.true_reward, data.reward, corrected, mask=data.mask, levels=truth
+            data.true_reward,
+            data.reward,
+            corrected,
+            mask=data.mask,
+            levels=truth,
+            event_level=self.config.num_groups - 1,
         )
         if assignment.labels is not None:
             logs.update(pairwise_grouping_scores(truth, assignment.labels, data.mask))

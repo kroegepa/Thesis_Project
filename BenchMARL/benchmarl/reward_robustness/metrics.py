@@ -83,18 +83,49 @@ def adjusted_rand_index(
     return float(adjusted_rand_score(t, p))
 
 
+def event_contrast_sums(
+    true_reward: torch.Tensor,
+    corrected_reward: torch.Tensor,
+    event: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+):
+    """Within-timestep credit contrast between event agents and the other agents.
+
+    For every timestep that has both event agents (e.g. capturers) and non-event
+    agents, compares mean reward of event agents minus mean reward of the others, for
+    the corrected and the true rewards. Returns the two sums and the number of such
+    timesteps; ``contrast = sum_corrected / sum_true`` is 1 for an unbiased correction
+    and 0 if the event reward is shared equally by all agents of the timestep (credit
+    assignment destroyed, as with global grouping).
+    """
+    if mask is None:
+        mask = torch.ones_like(true_reward, dtype=torch.bool)
+    ev = (event & mask).float()
+    other = (~event & mask).float()
+    n_ev, n_other = ev.sum(-1), other.sum(-1)
+    rows = (n_ev > 0) & (n_other > 0)
+
+    def diff(x):
+        return (x * ev).sum(-1) / n_ev.clamp(min=1) - (x * other).sum(-1) / n_other.clamp(min=1)
+
+    return diff(corrected_reward)[rows].sum().item(), diff(true_reward)[rows].sum().item(), int(rows.sum())
+
+
 def reward_error_metrics(
     true_reward: torch.Tensor,
     observed_reward: torch.Tensor,
     corrected_reward: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     levels: Optional[torch.Tensor] = None,
+    event_level: Optional[int] = None,
 ) -> Dict[str, float]:
     """How close the corrected rewards are to the true rewards.
 
     Reports MSE before/after correction and, if oracle ``levels`` are given, the mean
     error (systematic bias) and MSE per reward level. Bias matters more than MSE for
     learning: variance averages out over samples, a level-dependent bias does not.
+    ``event_level`` (default: highest level present) defines the "event" agents for
+    the within-timestep ``event_contrast`` (see :func:`event_contrast_sums`).
     """
     if mask is None:
         mask = torch.ones_like(true_reward, dtype=torch.bool)
@@ -107,6 +138,13 @@ def reward_error_metrics(
     if t.numel() > 1 and t.std() > 0 and c.std() > 0:
         out["corr_corrected"] = torch.corrcoef(torch.stack([t, c]))[0, 1].item()
     if levels is not None:
+        if event_level is None:
+            event_level = int(levels[mask].max())
+        num, den, n_rows = event_contrast_sums(
+            true_reward, corrected_reward, levels == event_level, mask
+        )
+        if n_rows > 0 and den != 0:
+            out["event_contrast"] = num / den
         lv = levels[mask]
         for level in torch.unique(lv).tolist():
             sel = lv == level
