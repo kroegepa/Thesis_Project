@@ -81,6 +81,8 @@ grouping_lr: 0.001
 grouping_batch_size: 512
 # Also feed the next observation o' to the grouping network (rewards are R(s, a, s'))
 grouping_use_next_obs: False
+# Append a one-hot agent index to the grouping-network input (role-dependent rewards)
+grouping_use_agent_id: False
 # Compute the groups of an iteration with the parameters fitted on previous iterations only, so the
 # grouping does not depend on the current noise realisation. False reproduces the original No-Warmup.
 grouping_out_of_sample: True

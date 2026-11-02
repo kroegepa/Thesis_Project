@@ -96,6 +96,7 @@ class ExperimentConfig:
     grouping_lr: float = MISSING
     grouping_batch_size: int = MISSING
     grouping_use_next_obs: bool = MISSING
+    grouping_use_agent_id: bool = MISSING
     grouping_out_of_sample: bool = MISSING
     grouping_gmm_sort: bool = MISSING
     grouping_epsilon: float = MISSING

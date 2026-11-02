@@ -88,6 +88,17 @@ METHODS = {
         },
     ),
     "rm_only_next": ("reward_model_only", {"epochs": 5, "use_next_obs": True}),
+    # Sensitivity
+    "rm_kmeans_next_e35": ("reward_model", {"epochs": 35, "use_next_obs": True}),
+    "rm_kmeans_next_e1": ("reward_model", {"epochs": 1, "use_next_obs": True}),
+    "rm_eps05_next": (
+        "reward_model",
+        {"epochs": 5, "use_next_obs": True, "reward_model_assign": "epsilon", "epsilon": 0.5},
+    ),
+    "rm_eps2_next": (
+        "reward_model",
+        {"epochs": 5, "use_next_obs": True, "reward_model_assign": "epsilon", "epsilon": 2.0},
+    ),
 }
 
 

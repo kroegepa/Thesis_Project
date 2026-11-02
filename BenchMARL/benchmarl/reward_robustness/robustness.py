@@ -101,6 +101,11 @@ class RewardRobustness:
         action = batch.get((g, "action"))
         if not torch.is_floating_point(action):
             action = torch.nn.functional.one_hot(action.long(), self.n_discrete_actions).float()
+        if self.config.grouping_use_agent_id:
+            # Append a one-hot agent index so models can represent role-dependent rewards
+            n_agents = action.shape[-2]
+            agent_id = torch.eye(n_agents, dtype=action.dtype, device=action.device)
+            action = torch.cat([action, agent_id.expand(*action.shape[:-1], n_agents)], -1)
         reward = batch.get(("next", g, "reward")).squeeze(-1)
         mask = batch.get((g, "mask"), None)
         mask = torch.ones_like(reward, dtype=torch.bool) if mask is None else mask.bool()
