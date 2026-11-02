@@ -70,6 +70,7 @@ class GroupingConfig:
     reward_model_assign: str = "kmeans"
     reward_model_residual: bool = False
     reward_model_heads: int = 1
+    reward_model_min_skill_z: float = 3.0
     epsilon: float = 0.5
 
 
@@ -320,8 +321,14 @@ class RewardModelGrouper(_NetworkGrouper):
     ``reward_model_heads > 1``: the model is a bootstrapped ensemble (shared encoder,
     one output head per member, each trained with Poisson(1) bootstrap weights). Agents
     whose predictive std across heads exceeds ``epsilon`` are left ungrouped and keep
-    their own (unbiased) reward. An untrained or unsure model therefore falls back to
-    no correction instead of grouping agents with different rewards.
+    their own (unbiased) reward.
+
+    ``reward_model_min_skill_z > 0``: rewards are only corrected once the model beats a
+    constant predictor out of sample, measured by a paired z-test on the squared errors
+    of the previous batch (computed before training on it). Before that, a model that
+    has not yet learned the rare reward events predicts nearly the same value for
+    every agent, so similarity grouping would degenerate into global grouping and erase
+    the credit of exactly those events; with the gate it falls back to no correction.
     """
 
     replace_with_prediction = False
@@ -334,6 +341,21 @@ class RewardModelGrouper(_NetworkGrouper):
             )
         self.loss = _LOSSES[cfg.reward_model_loss](reduction="none")
         self.out_dim = max(cfg.reward_model_heads, 1)
+        self.skill_z: Optional[float] = None
+
+    @property
+    def skilled(self) -> bool:
+        """Whether the model passed the out-of-sample skill test (always if disabled)."""
+        thr = self.cfg.reward_model_min_skill_z
+        return thr <= 0 or (self.skill_z is not None and self.skill_z >= thr)
+
+    @staticmethod
+    def skill_zscore(reward: torch.Tensor, pred: torch.Tensor) -> float:
+        """Paired z-statistic of ``(r~ - mean)^2 - (r~ - f)^2`` (> 0: f beats a constant)."""
+        d = (reward - reward.mean()) ** 2 - (reward - pred) ** 2
+        if d.numel() < 2 or d.std() == 0:
+            return 0.0
+        return (d.mean() / (d.std() / d.numel() ** 0.5)).item()
 
     def predict_mean_std(self, data: GroupData) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Mean prediction ``[..., A]`` and, for ensembles, the std across heads."""
@@ -360,6 +382,9 @@ class RewardModelGrouper(_NetworkGrouper):
                 resid = (data.reward - pred)[data.mask]
             # Out-of-sample residual variance: sigma^2 + model error (upper bound on sigma^2)
             logs["grouper/residual_var"] = resid.var().item() if resid.numel() > 1 else 0.0
+            self.skill_z = self.skill_zscore(data.reward[data.mask], pred[data.mask])
+            logs["grouper/skill_z"] = self.skill_z
+            logs["grouper/skilled"] = float(self.skilled)
             if std is not None:
                 logs["grouper/confident_frac"] = (
                     (std[data.mask] <= self.cfg.epsilon).float().mean().item()
@@ -368,8 +393,8 @@ class RewardModelGrouper(_NetworkGrouper):
         return logs
 
     def assign(self, data: GroupData) -> Assignment:
-        if self.n_updates == 0:
-            return Assignment()  # nothing learned yet: leave rewards unchanged
+        if self.n_updates == 0 or not self.skilled:
+            return Assignment()  # nothing (reliable) learned yet: leave rewards unchanged
         pred, std = self.predict_mean_std(data)
         return assignment_from_predictions(
             pred,

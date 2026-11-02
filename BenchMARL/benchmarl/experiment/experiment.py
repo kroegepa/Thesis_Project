@@ -104,6 +104,7 @@ class ExperimentConfig:
     reward_model_assign: str = MISSING
     reward_model_residual: bool = MISSING
     reward_model_heads: int = MISSING
+    reward_model_min_skill_z: float = MISSING
 
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING

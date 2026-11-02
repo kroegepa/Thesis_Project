@@ -102,6 +102,10 @@ reward_model_residual: False
 # exceeds grouping_epsilon are not grouped (they keep their own reward), so an unsure model falls
 # back to no correction instead of merging agents with different rewards
 reward_model_heads: 1
+# Only correct rewards once the reward model beats a constant predictor out of sample (paired
+# z-test on the previous batch). Prevents an untrained model from degenerating into global
+# grouping, which erases the credit of rare reward events. 0 disables the gate
+reward_model_min_skill_z: 3.0
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8

@@ -241,6 +241,17 @@ class TestGroupers:
         corrected = apply_consensus(data.reward, assignment, data.mask)
         assert torch.equal(corrected[~assignment.active], data.reward[~assignment.active])
 
+    def test_skill_gate_blocks_unskilled_model(self):
+        torch.manual_seed(0)
+        grouper = make_grouper(GroupingConfig(method="reward_model", epochs=2), self.spec)
+        for seed in range(3):
+            data = _fake_pursuit_data(seed=seed)
+            data.true_reward = torch.full_like(data.true_reward, -0.1)  # no learnable signal
+            data.reward = data.true_reward + torch.randn_like(data.reward)
+            assignment, logs = grouper(data)
+        assert logs["grouper/skill_z"] < 3.0 and not grouper.skilled
+        assert assignment.labels is None and assignment.weights is None  # falls back to no-op
+
     def test_warmup_grouper(self):
         torch.manual_seed(0)
         grouper = make_grouper(GroupingConfig(method="warmup", epochs=40), self.spec)

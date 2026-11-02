@@ -84,6 +84,11 @@ _ALL_VARIANTS = {
 }
 FAMILIES = {
     "rm_next": ({"use_next_obs": True}, _ALL_VARIANTS),
+    # Without the out-of-sample skill gate (groups as soon as the model is trained once)
+    "rm_next_nogate": (
+        {"use_next_obs": True, "reward_model_min_skill_z": 0.0},
+        {k: _ALL_VARIANTS[k] for k in ["kmeans", "eps0.5", "kernel0.5"]},
+    ),
     # Bootstrapped 5-head ensemble: agents with predictive std > epsilon stay ungrouped
     "rm_next_ens": (
         {"use_next_obs": True, "reward_model_heads": 5},
@@ -213,6 +218,7 @@ def run_family(name, args, sigma, stream, spec):
     for i, data in enumerate(stream):
         _perturb(data, args, sigma, i)
         evaluate = i % 2 == 1
+        skilled = grouper.skilled  # skill test of the previous batch, as in assign()
         pred_out, std_out = (
             grouper.predict_mean_std(data) if evaluate and grouper.n_updates else (None, None)
         )
@@ -225,7 +231,7 @@ def run_family(name, args, sigma, stream, spec):
         levels = oracle_labels(data.true_reward, spec, args.num_groups, data.mask)
         for v, (mode, kw, in_sample) in variants.items():
             pred, std = (pred_in, std_in) if in_sample else (pred_out, std_out)
-            if pred is None:
+            if pred is None or not skilled:
                 assignment = Assignment()
             else:
                 eps = kw.get("epsilon", grouper.cfg.epsilon)
