@@ -43,14 +43,15 @@ python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=warmup,gmm experiment.grouping_epochs=35 \
   experiment.grouping_use_next_obs=False,True "${@:2}"
 
-# 2) Warm-up-free reward-model instances (see notes/paper_review_and_revision_plan.md, Sec. 3)
-#    kernel consensus on predicted rewards, o' as input, 5 epochs/iteration; 1 head vs a
-#    5-head bootstrapped ensemble with confidence gating; plus the reward-model-only baseline.
+# 2) Warm-up-free reward-model instances (see notes/paper_review_and_revision_plan.md, Sec. 3):
+#    kernel consensus on predicted rewards, o' as input, 1 epoch per iteration (more epochs
+#    only overfit the noisy targets), with and without the out-of-sample skill gate; plus
+#    the reward-model-only baseline (Romoff et al.-style, as asked by Reviewer 2).
 python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=reward_model,reward_model_only \
-  experiment.grouping_use_next_obs=True experiment.grouping_epochs=5 \
+  experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
   experiment.reward_model_assign=kernel experiment.grouping_epsilon=0.5 \
-  experiment.reward_model_heads=1,5 "${@:2}"
+  experiment.reward_model_min_skill_z=0,3 "${@:2}"
 
 # 3) Robust global aggregation baseline (Byzantine-style global median, Reviewer 3)
 python benchmarl/run.py -m $COMMON \

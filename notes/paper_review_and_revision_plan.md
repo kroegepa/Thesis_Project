@@ -139,6 +139,8 @@ capture reward that drives learning. The benchmark therefore reports:
 | oracle | always | 10.14 (1.00) | 6.11 (1.00) | 4.38 (1.00) |
 | global (Fig. 5 ablation) | no | 0 (0.00) | 0 (0.00) | 0 (0.00) |
 | GMM on current noisy rewards (No-Warmup limit) | no | 3.46 (0.92) | 1.85 (0.85) | 1.31 (0.85) |
+| GMM classifier, original No-Warmup (unsorted, in-sample) | no | – | – | 0.80 (0.20) |
+| GMM classifier, sorted labels + out-of-sample | no | – | – | 1.28 (0.26) |
 | warmup, input (o, a) (paper) | warm-up | – | 3.73 (0.64) | 2.72 (0.65) |
 | warmup, input (o, a, o') | warm-up | – | – | **3.95** (0.92) |
 | reward model, (o, a), k-means | no | – | – | 1.58 (0.40) |
@@ -179,6 +181,21 @@ capture reward that drives learning. The benchmark therefore reports:
    model error (it never averages out), whereas the consensus error is zero-mean noise,
    so SNR flatters it. It must be in the end-to-end comparison: it is exactly the
    baseline Reviewer 2 asked for.
+8. **The No-Warmup classifier stays worse than no correction even after the fixes.**
+   Sorting the GMM labels and grouping out-of-sample raises its SNR from 0.80 to 1.28,
+   still below 1.45 for No-Correction. Clustering *noisy* rewards gives labels that are
+   mostly noise; *regressing* them (the reward model) is what makes learned grouping
+   work.
+9. **Train the reward model for 1 epoch per iteration, not 5 or 35.** With 1 epoch the
+   grouping quality is unchanged (SNR 3.31 vs 3.32 at σ = 3.5) at a fifth of the cost.
+   With 5 epochs the model overfits the noisy targets: it predicts *worse* than a
+   constant out of sample (skill z between −5 and −13), even though its ranking is
+   still useful.
+10. **The skill gate behaves as intended with 1 epoch.** It stays shut while the model
+    cannot predict (z ≈ −4 to 2.5) and opens once it can (z ≈ 9–20 from about the 11th
+    stream iteration). Capture contrast is 0.85 when pooled over the stream. Pooled SNR
+    is lower (1.8) only because the 20-iteration stream contains the closed-gate phase,
+    which falls back to No-Correction.
 
 **End-to-end pilots (indicative only).**
 - Setting: 1 seed, Pursuit with 8 pursuers, σ = 2.5, 40 iterations of 3 000 frames.
@@ -189,13 +206,18 @@ capture reward that drives learning. The benchmark therefore reports:
 PILOT_TABLE
 
 - Oracle ≫ No-Correction, consistent with the paper.
-- The reward-model groupers do not yet beat No-Correction end-to-end. The diagnostics
-  show why: during the first ~15 iterations the model has not learned captures yet,
-  so it groups capturers with non-capturers. Capture contrast is only ~0.2–0.3 then
-  (vs ~0.65 later), which temporarily erases credit exactly when the policy most needs
-  it.
-- The confidence-gated ensemble (`reward_model_heads=5`: agents whose bootstrap std
-  exceeds ε stay ungrouped) is designed to fall back to No-Correction in that phase.
+- The ungated reward-model groupers did not beat No-Correction end-to-end. The kernel
+  variant was clearly worse. The diagnostics show why: in noisy training, captures are
+  rare at first and the model has not learned them, so it predicts ~−0.1 for everyone.
+  Kernel/ε grouping then merges everyone, i.e. becomes global grouping. Capture
+  contrast was 0.0–0.1 for the first ~13 iterations, which erases capture credit
+  exactly when the policy needs it. K-means (forced K = 3) erased less (contrast
+  ~0.2–0.3) and ended level with No-Correction.
+- The bootstrap-ensemble gate (`reward_model_heads=5`) did **not** catch this: the
+  heads agree on "−0.1 everywhere", so the confident fraction was 1.0.
+- The out-of-sample **skill gate** (`reward_model_min_skill_z=3`, 1 epoch per
+  iteration) is the fix that the offline data supports. Its end-to-end pilots are in
+  the table above.
 - **Before claiming end-to-end gains, run the multi-seed sweep**
   (`examples/reward_robustness/sweep.sh`) on the cluster with the paper's budget.
 

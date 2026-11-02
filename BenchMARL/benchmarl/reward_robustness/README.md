@@ -37,6 +37,22 @@ iteration k come from parameters fitted on iterations < k, so they do not depend
 the current noise realisation. See the docstring of `groupers.py` for why this
 matters.
 
+`reward_model` safeguards:
+- `reward_model_min_skill_z` (default 3): rewards are only corrected once the model
+  beats a constant predictor out of sample. An untrained model predicts nearly the
+  same reward for everyone, and similarity grouping would then act like global
+  grouping and erase the credit of rare reward events.
+- `reward_model_heads > 1`: a bootstrapped ensemble that leaves agents with uncertain
+  predictions ungrouped. In our tests the heads agreed even on missed rare events, so
+  this did not help.
+
+Diagnostics with `evaluate_grouping=True` (they use the true rewards, analysis only):
+- `reward_robustness/event_contrast`: within-timestep credit of the highest reward
+  level; 0 means the event reward is shared by everyone;
+- `pair_precision` / `pair_recall` against the oracle partition;
+- `level*_bias`, MSE before and after correction;
+- `grouper/skill_z`.
+
 ## Migrating from the old flags
 
 | old configuration | new configuration |
@@ -52,11 +68,15 @@ matters.
 
 ```bash
 # Pursuit, 16 pursuers, sigma = 3.5, warm-up-free reward-model grouping with diagnostics
+# (recommended settings from the offline benchmark: o' as input, 1 epoch per iteration,
+#  kernel consensus with epsilon = 0.5, out-of-sample skill gate)
 python benchmarl/run.py algorithm=mappo task=pettingzoo/pursuit \
     model=layers/cnn model@critic_model=layers/cnn \
     experiment.reward_perturbation=True experiment.reward_perturbation_stdev=3.5 \
     experiment.grouping_method=reward_model experiment.grouping_use_next_obs=True \
-    experiment.grouping_epochs=5 experiment.evaluate_grouping=True
+    experiment.grouping_epochs=1 experiment.reward_model_assign=kernel \
+    experiment.grouping_epsilon=0.5 experiment.reward_model_min_skill_z=3 \
+    experiment.evaluate_grouping=True
 
 # Bernoulli corruption, oracle grouping (median consensus is chosen automatically)
 python benchmarl/run.py algorithm=mappo task=pettingzoo/pursuit \

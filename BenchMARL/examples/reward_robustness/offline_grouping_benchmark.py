@@ -89,6 +89,15 @@ FAMILIES = {
         {"use_next_obs": True, "reward_model_min_skill_z": 0.0},
         {k: _ALL_VARIANTS[k] for k in ["kmeans", "eps0.5", "kernel0.5"]},
     ),
+    # Less overfitting: 1 epoch per batch, with and without the skill gate
+    "rm_next_e1": (
+        {"use_next_obs": True, "epochs": 1},
+        {k: _ALL_VARIANTS[k] for k in ["kmeans", "eps0.5", "kernel0.5", "only"]},
+    ),
+    "rm_next_e1_nogate": (
+        {"use_next_obs": True, "epochs": 1, "reward_model_min_skill_z": 0.0},
+        {k: _ALL_VARIANTS[k] for k in ["kmeans", "eps0.5", "kernel0.5"]},
+    ),
     # Bootstrapped 5-head ensemble: agents with predictive std > epsilon stay ungrouped
     "rm_next_ens": (
         {"use_next_obs": True, "reward_model_heads": 5},
@@ -177,10 +186,8 @@ def _perturb(data, args, sigma, i):
 
 def _cfg(args, method, overrides):
     cfg = GroupingConfig(method=method, num_groups=args.num_groups, **overrides)
-    if method in ("warmup", "gmm"):
-        cfg.epochs = args.classifier_epochs
-    else:
-        cfg.epochs = args.reward_model_epochs
+    if "epochs" not in overrides:
+        cfg.epochs = args.classifier_epochs if method in ("warmup", "gmm") else args.reward_model_epochs
     if args.noise == "bernoulli":
         cfg.reward_model_loss = "l1"  # conditional median: robust to outliers
     return cfg
@@ -215,6 +222,7 @@ def run_family(name, args, sigma, stream, spec):
     grouper = make_grouper(_cfg(args, "reward_model", overrides), spec, device=args.device)
     accs = {v: Accumulator(args.num_groups - 1) for v in variants}
     need_insample = any(ins for _, _, ins in variants.values())
+    gate_open, skill_z = [], []
     for i, data in enumerate(stream):
         _perturb(data, args, sigma, i)
         evaluate = i % 2 == 1
@@ -228,6 +236,8 @@ def run_family(name, args, sigma, stream, spec):
         )
         if not evaluate:
             continue
+        gate_open.append(float(skilled and pred_out is not None))
+        skill_z.append(grouper.skill_z if grouper.skill_z is not None else float("nan"))
         levels = oracle_labels(data.true_reward, spec, args.num_groups, data.mask)
         for v, (mode, kw, in_sample) in variants.items():
             pred, std = (pred_in, std_in) if in_sample else (pred_out, std_out)
@@ -245,7 +255,11 @@ def run_family(name, args, sigma, stream, spec):
                 )
             corrected = apply_consensus(data.reward, assignment, data.mask, method=args.consensus)
             accs[v].add(data.true_reward, corrected, levels, assignment.labels)
-    return {f"{name}/{v}": acc.summary() for v, acc in accs.items()}
+    out = {f"{name}/{v}": acc.summary() for v, acc in accs.items()}
+    for summary in out.values():
+        summary["gate_open_frac"] = sum(gate_open) / max(len(gate_open), 1)
+        summary["skill_z"] = skill_z
+    return out
 
 
 def main():
@@ -271,7 +285,8 @@ def main():
 
     spec = get_task_spec(args.task)
     stream = load_stream(args.stream, args.n_actions, args.max_batches)
-    keys = ["corr", "signal", "contrast", "noise_other", "snr", "pair_precision", "pair_recall"]
+    keys = ["corr", "signal", "contrast", "noise_other", "snr", "pair_precision", "pair_recall",
+            "gate_open_frac"]
     results = {}
     for sigma in args.sigma:
         for name in args.methods:
