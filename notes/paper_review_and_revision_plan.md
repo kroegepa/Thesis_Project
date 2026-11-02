@@ -248,6 +248,34 @@ capture reward that drives learning. The benchmark therefore reports:
   (`examples/reward_robustness/sweep.sh`) on the cluster with the paper's budget.
 
 
+### 3.3 Ways forward under noise: feasibility checks
+
+Offline, Pursuit with 16 pursuers, σ = 3.5, same stream and metrics as §3.2.
+Reference SNR: No-Correction 1.45, oracle 4.38.
+
+| idea | result | verdict |
+|---|---|---|
+| Reward-free clustering of (o, Δo, a) (k-means, K = 64–1024; full 7×7 view or a local 3×3 crop), then per-cluster noisy-reward means with confidence gating | 0% of captures land in capture-dominated clusters; SNR 0.0–0.5 | **fails**: a capture is a combinatorial configuration, not a distinctive region of input space |
+| Reward model trained on a replay buffer of all past transitions | gate opens at the same iteration (~10); contrast drops (0.49) as early capture-poor data dilutes recent data | **no gain** |
+| Locality prior: reward model on the agent's 5×5 neighbourhood | gate opens at iteration 7–8 instead of 10; SNR 1.86 vs 1.66 | **modest gain** |
+| **Small clean budget, hybrid**: reward model warm-started on k clean batches, then trained online on noisy rewards (gated, out of sample) | k = 1: 1.84 · **k = 2 (6k frames): 3.02** · k = 5: 3.35 · k = 10: 3.43 | **best value per clean frame** |
+| Warmup classifier (with o'), frozen after k clean batches | k = 1: 0.99 · k = 2: 2.40 · k = 5: 3.60 · k = 10: 3.93 | best with ≥ 5 clean batches; collapses with 1–2 |
+
+**Interpretation.** Without prior information, finding the groups means learning the
+reward's level-set structure from noisy labels. That has an unavoidable start-up cost,
+which grows with σ²/Δ² and with how hard the rewarding event is to recognise. The
+noise-only reward model pays this cost safely: the gate falls back to No-Correction
+until the model is informative, about 8–10 iterations here.
+
+A tiny clean budget buys the cost down. Two clean batches (6k frames, 4% of the
+current 150k-frame warm-up and < 0.5% of training) followed by noisy fine-tuning
+already reach ~70% of the oracle's SNR.
+
+Suggested framing for the revision: replace the binary "warm-up vs no warm-up" with a
+**clean-data budget curve** from 0 clean frames (noise-only, gated) through a few
+batches (hybrid) to the full warm-up. This answers Reviewer 1's cost/benefit question
+directly and turns "needs clean rewards" into "needs very few".
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)
