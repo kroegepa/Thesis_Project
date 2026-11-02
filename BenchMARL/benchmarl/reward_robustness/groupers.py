@@ -346,26 +346,44 @@ class RewardModelGrouper(_NetworkGrouper):
     def assign(self, data: GroupData) -> Assignment:
         if self.n_updates == 0:
             return Assignment()  # nothing learned yet: leave rewards unchanged
-        pred = self.predict_rewards(data)
-        if self.replace_with_prediction:
-            return Assignment(replace=pred)
-        offset = pred if self.cfg.reward_model_residual else None
-        mode = self.cfg.reward_model_assign
-        none = torch.full_like(data.reward, -1, dtype=torch.long)
-        if mode == "kmeans":
-            labels = kmeans_1d_labels(pred, self.cfg.num_groups, mask=data.mask)
-            return Assignment(labels=labels, offset=offset)
-        if mode == "epsilon":
-            labels = epsilon_labels(pred, self.cfg.epsilon, mask=data.mask)
-            return Assignment(labels=labels, offset=offset)
-        if mode == "global":
-            labels = torch.where(data.mask, torch.zeros_like(none), none)
-            return Assignment(labels=labels, offset=offset)
-        if mode == "kernel":
-            diff = pred.unsqueeze(-1) - pred.unsqueeze(-2)
-            weights = torch.exp(-0.5 * (diff / max(self.cfg.epsilon, 1e-8)) ** 2)
-            return Assignment(weights=weights, offset=offset)
-        raise ValueError(f"Unknown reward_model_assign '{mode}'")
+        return assignment_from_predictions(
+            self.predict_rewards(data),
+            data.mask,
+            mode="replace" if self.replace_with_prediction else self.cfg.reward_model_assign,
+            num_groups=self.cfg.num_groups,
+            epsilon=self.cfg.epsilon,
+            residual=self.cfg.reward_model_residual,
+        )
+
+
+def assignment_from_predictions(
+    pred: torch.Tensor,
+    mask: torch.Tensor,
+    mode: str = "kmeans",
+    num_groups: int = 3,
+    epsilon: float = 0.5,
+    residual: bool = False,
+) -> Assignment:
+    """Turn predicted rewards ``[..., A]`` into an :class:`Assignment`.
+
+    ``mode``: ``kmeans`` | ``epsilon`` | ``kernel`` | ``global`` (see
+    :class:`RewardModelGrouper`) or ``replace`` (use the predictions as rewards).
+    """
+    if mode == "replace":
+        return Assignment(replace=pred)
+    offset = pred if residual else None
+    none = torch.full_like(pred, -1, dtype=torch.long)
+    if mode == "kmeans":
+        return Assignment(labels=kmeans_1d_labels(pred, num_groups, mask=mask), offset=offset)
+    if mode == "epsilon":
+        return Assignment(labels=epsilon_labels(pred, epsilon, mask=mask), offset=offset)
+    if mode == "global":
+        return Assignment(labels=torch.where(mask, torch.zeros_like(none), none), offset=offset)
+    if mode == "kernel":
+        diff = pred.unsqueeze(-1) - pred.unsqueeze(-2)
+        weights = torch.exp(-0.5 * (diff / max(epsilon, 1e-8)) ** 2)
+        return Assignment(weights=weights, offset=offset)
+    raise ValueError(f"Unknown reward_model_assign '{mode}'")
 
 
 class RewardModelOnlyGrouper(RewardModelGrouper):
