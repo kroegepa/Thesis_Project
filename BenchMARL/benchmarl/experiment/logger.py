@@ -18,15 +18,12 @@ import torchrl
 
 from tensordict import TensorDictBase
 from torch import Tensor
-from sklearn.metrics import precision_score, recall_score, f1_score, adjusted_rand_score, normalized_mutual_info_score, confusion_matrix
-from scipy.optimize import linear_sum_assignment
 
 from torchrl.record import TensorboardLogger
 from torchrl.record.loggers import get_logger
 from torchrl.record.loggers.wandb import WandbLogger
 
 from benchmarl.environments import Task
-import wandb
 
 
 class Logger:
@@ -50,8 +47,13 @@ class Logger:
         self.model_name = model_name
         self.group_map = group_map
         self.seed = seed
-        self.eval_table = wandb.Table(columns=["step", "reward"])
+        # Per-episode evaluation returns, logged as a wandb table at the end of training
         self.eval_key = "eval/return/episode_reward"
+        self.eval_table = None
+        if "wandb" in experiment_config.loggers:
+            import wandb
+
+            self.eval_table = wandb.Table(columns=["step", "reward"])
 
         if experiment_config.create_json:
             self.json_writer = JsonWriter(
@@ -171,43 +173,6 @@ class Logger:
         self.log(to_log, step=step)
         return global_episode_rewards.mean().item()
     
-    def log_grouping(self, group: str, oracle_labels: torch.Tensor, predicted_labels: torch.Tensor, step: int):
-
-        #TODO: Extend for different groups present
-        # Ensure inputs are on CPU and flattened
-        y_true = oracle_labels.argmax(dim=-1).view(-1).cpu().numpy()
-        y_pred = predicted_labels.argmax(dim=-1).view(-1).cpu().numpy()
-        
-        labels=[i for i in range(oracle_labels.shape[-1])]
-        precision_weighted = precision_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0)
-        recall_weighted = recall_score(y_true, y_pred, average='weighted', labels=labels, zero_division=0)
-        f1_weighted = f1_score(y_true, y_pred, average='weighted',labels=labels, zero_division=0)
-
-        precision_macro = precision_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
-        recall_macro = recall_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)
-        f1_macro = f1_score(y_true, y_pred, average='macro', labels=labels, zero_division=0)  
-
-        cm = confusion_matrix(y_true, y_pred)
-        row_ind, col_ind = linear_sum_assignment(-cm)
-        clustering_accuracy = cm[row_ind, col_ind].sum() / cm.sum()
-        ari = adjusted_rand_score(y_true, y_pred)
-        nmi = normalized_mutual_info_score(y_true, y_pred)
-        
-
-        to_log = {
-            f"grouping/{group}/precision_weighted": precision_weighted,
-            f"grouping/{group}/recall_weighted": recall_weighted,
-            f"grouping/{group}/f1_score_weighted": f1_weighted,
-            f"grouping/{group}/precision_macro": precision_macro,
-            f"grouping/{group}/recall_macro": recall_macro,
-            f"grouping/{group}/f1_score_macro": f1_macro,
-            f"grouping/{group}/clustering_accuracy": clustering_accuracy,
-            f"grouping/{group}/adjusted_rand_index": ari,
-            f"grouping/{group}/normalized_mutual_info": nmi,
-        }
-
-        self.log(to_log, step=step)
-
     def log_training(self, group: str, training_td: TensorDictBase, step: int):
         if not len(self.loggers):
             return
@@ -286,11 +251,7 @@ class Logger:
                     )
 
         self.log(to_log, step=step)
-        self.log_evaluation_seeds(
-            eval_dict=to_log_eval,
-            key="eval/return/episode_reward",
-            step=step,
-            )
+        self.log_evaluation_seeds(eval_dict=to_log_eval, step=step)
         if video_frames is not None and max_length_rollout_0 > 1:
             video_frames = np.stack(video_frames[: max_length_rollout_0 - 1], axis=0)
             vid = torch.tensor(
@@ -323,23 +284,30 @@ class Logger:
             else:
                 for key, value in dict_to_log.items():
                     logger.log_scalar(key.replace("/", "_"), value, step=step)
-    def log_evaluation_seeds(self, eval_dict: Dict, key = None, step: int = None):
+    def log_evaluation_seeds(self, eval_dict: Dict, step: int):
+        """Log the return of every evaluation episode (not only min/mean/max).
+
+        Note: the ``_seed_{i}`` suffix is kept for compatibility with existing analysis
+        scripts; ``i`` indexes evaluation *episodes* of this run, not training seeds.
+        """
         for logger in self.loggers:
-            if isinstance(logger, WandbLogger):
-                for key,val in eval_dict.items():
-                    for value in val:
+            for key, values in eval_dict.items():
+                if isinstance(logger, WandbLogger):
+                    for value in values:
                         self.eval_table.add_data(step, value)
-            else:
-                for key, val in eval_dict.items():
-                    for i, value in enumerate(val):
-                        key_i = f"{key}_seed_{i}"
-                        logger.log_scalar(key_i.replace("/", "_"), value, step=step)
+                else:
+                    for i, value in enumerate(values):
+                        logger.log_scalar(
+                            f"{key}_seed_{i}".replace("/", "_"), value, step=step
+                        )
+
     def log_evaluation_table(self):
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
-                logger.experiment.log({self.eval_key + "_boxplot": self.eval_table}, commit=True)
-            else:
-                pass
+                logger.experiment.log(
+                    {self.eval_key + "_boxplot": self.eval_table}, commit=True
+                )
+
     def finish(self):
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
@@ -457,12 +425,9 @@ class Logger:
                 key + "_std": value.std().item(),
             }
         )
-    def _log_evaluation_spread(self, to_log: Dict[str, Tensor], key: str, value: Tensor):
-            to_log.update(
-                {
-                key : value.tolist(),
-                }
-            )
+
+    def _log_evaluation_spread(self, to_log: Dict, key: str, value: Tensor):
+        to_log.update({key: value.tolist()})
 
 class JsonWriter:
     """

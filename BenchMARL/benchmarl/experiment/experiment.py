@@ -24,10 +24,6 @@ import torch
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictSequential
 from torchrl.collectors import SyncDataCollector
-from torch.utils.data import DataLoader, TensorDataset
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
 from torchrl.envs.transforms import Compose
@@ -36,13 +32,13 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-from benchmarl.pof_methods.pof_methods import oracle_grouping, grouping_reward_averaging, PursuitGroupingCNN, spread_grouping, SpreadGroupingMLP, fuzzy_grouping, AdversarialPursuitPredatorCNN, BattleBlueCNN
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
 from benchmarl.experiment.logger import Logger
 from benchmarl.models import GnnConfig, SequenceModelConfig
 from benchmarl.models.common import ModelConfig
+from benchmarl.reward_robustness import RewardRobustness
 from benchmarl.utils import (
     _add_rnn_transforms,
     _read_yaml_config,
@@ -88,11 +84,24 @@ class ExperimentConfig:
     reward_perturbation_type: str = MISSING
     reward_perturbation_stdev: float = MISSING
     reward_perturbation_flip_prob: float = MISSING
+    reward_perturbation_outlier_value: float = MISSING
 
-    pof_enable: bool = MISSING
-    oracle_grouping: bool = MISSING
-    evaluate_grouping: bool = MISSING
+    grouping_method: str = MISSING
+    consensus: str = MISSING
+    consensus_trim: float = MISSING
     num_groups: int = MISSING
+    evaluate_grouping: bool = MISSING
+    warmup_iters: int = MISSING
+    grouping_epochs: int = MISSING
+    grouping_lr: float = MISSING
+    grouping_batch_size: int = MISSING
+    grouping_use_next_obs: bool = MISSING
+    grouping_out_of_sample: bool = MISSING
+    grouping_gmm_sort: bool = MISSING
+    grouping_epsilon: float = MISSING
+    reward_model_loss: str = MISSING
+    reward_model_assign: str = MISSING
+    reward_model_residual: bool = MISSING
 
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
@@ -100,10 +109,6 @@ class ExperimentConfig:
 
     max_n_iters: Optional[int] = MISSING
     max_n_frames: Optional[int] = MISSING
-
-    train_grouping_no_warmup: bool = MISSING
-    train_grouping_warmup: bool = MISSING
-    warmup_iters: int = MISSING
 
     on_policy_collected_frames_per_batch: int = MISSING
     on_policy_n_envs_per_worker: int = MISSING
@@ -409,15 +414,35 @@ class Experiment(CallbackNotifier):
         self._setup_task()
         self._setup_algorithm()
         self._setup_collector()
+        self._setup_reward_robustness()
         self._setup_logger()
         self._on_setup()
+
     def _setup_reset(self):
-        self.algorithm._policies_for_collection = {}
-        self.algorithm._policies_for_loss = {}
-        self.algorithm._losses_and_updaters = {}
+        """Re-initialise envs, algorithm (policies, losses, buffers, optimisers) and collector.
+
+        Used after the grouping warm-up. The experiment seed is reset first so the new
+        policies have the same initialisation as in a run without warm-up.
+        """
+        if not self.config.collect_with_grad:
+            self.collector.shutdown()
+        else:
+            self.rollout_env.close()
+        self.test_env.close()
+        seed_everything(self.seed)
         self._setup_task()
         self._setup_algorithm()
         self._setup_collector()
+
+    def _setup_reward_robustness(self):
+        self.reward_robustness = RewardRobustness(
+            self.config,
+            task_name=self.task_name,
+            group_map=self.group_map,
+            action_spec=self.action_spec,
+            device=self.config.train_device,
+        )
+
     def _perform_checks(self):
         for config in (self.model_config, self.critic_model_config):
             if isinstance(config, SequenceModelConfig):
@@ -687,361 +712,119 @@ class Experiment(CallbackNotifier):
             f"Evaluation results logged to loggers={self.config.loggers}"
             f"{' and to a json file in the experiment folder.' if self.config.create_json else ''}"
         )
-    def train_grouping_model(self, batch):
-        if self.task_name == "pursuit":
-            obs_list, act_list, label_list = [], [], []
 
-            obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
-            act = batch["pursuer"]["action"]       # [B, T, A, act_dim]
-            act_dim = 5
-            if self.config.train_grouping_no_warmup:
-                group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
+    def _collect_batch(self, iterator, reset_batch):
+        """Collect one batch of transitions. Returns ``(batch, reset_batch)``."""
+        if not self.config.collect_with_grad:
+            return next(iterator), reset_batch
+        with set_exploration_type(ExplorationType.RANDOM):
+            batch = self.rollout_env.rollout(
+                max_steps=-(
+                    -self.config.collected_frames_per_batch(self.on_policy)
+                    // self.rollout_env.batch_size.numel()
+                ),
+                policy=self.policy,
+                break_when_any_done=False,
+                auto_reset=False,
+                tensordict=reset_batch,
+            )
+            reset_batch = step_mdp(
+                batch[..., -1],
+                reward_keys=self.rollout_env.reward_keys,
+                action_keys=self.rollout_env.action_keys,
+                done_keys=self.rollout_env.done_keys,
+            )
+        return batch, reset_batch
+
+    def _new_collection_state(self):
+        if not self.config.collect_with_grad:
+            return iter(self.collector), None
+        return None, self.rollout_env.reset()
+
+    def _train_on_batch(self, batch: TensorDictBase, current_frames: int, log: bool = True):
+        """Add ``batch`` to the replay buffers and run the optimisation steps of every group."""
+        for group in self.train_group_map.keys():
+            group_batch = batch.exclude(*self._get_excluded_keys(group))
+            group_batch = self.algorithm.process_batch(group, group_batch)
+            if not self.algorithm.has_rnn:
+                group_batch = group_batch.reshape(-1)
+
+            group_buffer = self.replay_buffers[group]
+            group_buffer.extend(group_batch.to(group_buffer.storage.device))
+
+            training_tds = []
+            for _ in range(self.config.n_optimizer_steps(self.on_policy)):
+                for _ in range(
+                    -(
+                        -self.config.train_batch_size(self.on_policy)
+                        // self.config.train_minibatch_size(self.on_policy)
+                    )
+                ):
+                    training_tds.append(self._optimizer_loop(group))
+            training_td = torch.stack(training_tds)
+            if log:
+                self.logger.log_training(
+                    group, training_td, step=self.n_iters_performed
+                )
+                # Callback
+                self._on_train_end(training_td, group)
+
+            # Exploration update
+            if isinstance(self.group_policies[group], TensorDictSequential):
+                explore_layer = self.group_policies[group][-1]
             else:
-                group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
+                explore_layer = self.group_policies[group]
+            if hasattr(explore_layer, "step"):  # Step exploration annealing
+                explore_layer.step(current_frames)
 
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim)  # [B, T, A, act_dim]
-            act_list.append(act_onehot.reshape(-1, act_dim))            
-            obs_list.append(obs.reshape(-1, 3, 7, 7))
-            label_list.append(group.argmax(dim=-1).view(-1))
-        elif self.task_name == "simple_spread":
-            obs_list, act_list, label_list = [], [], []
-            obs_size = self.task.config['N'] * 6
+        # Update policy in collector
+        if not self.config.collect_with_grad:
+            self.collector.update_policy_weights_()
 
-            obs = batch["agent"]["observation"]  # [B, T, A, obs_size]
-            act = batch["agent"]["action"]       # [B, T, A, 5]
-            if self.config.train_grouping_no_warmup:
-                group = fuzzy_grouping(batch, self.task_name)
-            else:
-                group = oracle_grouping(batch, self.task_name)
-            act_dim = 5
-            #   obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            act_list.append(act.reshape(-1, act_dim))            
-            obs_list.append(obs.reshape(-1, obs_size))
-            label_list.append(group.argmax(dim=-1).view(-1))
-        elif self.task_name =="adversarial_pursuit":
-            obs_list, act_list, label_list = [], [], []
-            obs = batch["predator"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["predator"]["action"]       # [B, T, A]  (discrete)
-            if self.config.train_grouping_no_warmup:
-                group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
-            else:
-                group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
-            # Reshape correctly
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            obs = obs.reshape(-1, 5, 10, 10)
-            # One-hot encode actions
-            act_dim = 13
-            act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
-            act_list.append(act_onehot)
-            obs_list.append(obs)
-            label_list.append(group.argmax(dim=-1).view(-1))
-        elif self.task_name =="battle":
-            obs_list, act_list, label_list = [], [], []
-            obs = batch["red"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["red"]["action"]       # [B, T, A]  (discrete)
-            if self.config.train_grouping_no_warmup:
-                group = fuzzy_grouping(batch, self.task_name)  # [B, T, A, num_groups]
-            else:
-                group = oracle_grouping(batch, self.task_name)  # [B, T, A, num_groups]
-            # Reshape correctly
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            obs = obs.reshape(-1, 5, 13, 13)
-            # One-hot encode actions
-            act_dim = 21
-            act_onehot = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
-            act_list.append(act_onehot)
-            obs_list.append(obs)
-            label_list.append(group.argmax(dim=-1).view(-1))
-        obs_tensor = torch.cat(obs_list, dim=0)
-        act_tensor = torch.cat(act_list, dim=0)
-        label_tensor = torch.cat(label_list, dim=0)
-        device = obs_tensor.device
-        dataset = TensorDataset(obs_tensor, act_tensor, label_tensor)
-        dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
+    def _grouping_warmup(self):
+        """Pre-train the grouping function on clean rewards (Algorithm 1, lines 2-5).
 
-        optimizer = torch.optim.Adam(self.grouping_model.parameters(), lr=1e-3)
-        criterion = nn.CrossEntropyLoss()
-
-        self.grouping_model.train()
-        for epoch in range(35):
-            total_loss = 0
-            for obs_b, act_b, label_b in dataloader:
-                obs_b = obs_b.to(device)
-                act_b = act_b.to(device)
-                label_b = label_b.to(device)
-                optimizer.zero_grad()
-                logits = self.grouping_model(obs_b, act_b)
-                loss = criterion(logits, label_b)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-
-    def _apply_reward_perturbation(self, batch, perturbation_type, stdev, flip_prob):
-        if perturbation_type == "normal":
-            done = batch.get("done")
-            for group in self.group_map.keys():
-                # 1. Get the actual reward from `next`  
-                reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
-
-
-                # 2. Add Gaussian noise to per-step rewards
-                noise = torch.randn_like(reward) * stdev
-                reward_noisy = reward + noise
-
-                # 3. Set the modified reward back in the batch
-                batch.get("next").get(group).set("reward", reward_noisy)
-
-                # 4. Recompute cumulative episode_reward with reset at done
-                episode_reward = torch.zeros_like(reward_noisy)
-                cumulative = torch.zeros_like(reward_noisy[:, 0])  # [B, A, 1]
-                done_broadcast = done.unsqueeze(2).expand(-1, -1, reward.shape[2], -1)                
-                for t in range(reward_noisy.shape[1]):
-                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_noisy[:, t]
-                    episode_reward[:, t] = cumulative
-            
-                
-                # 5. Store recomputed episode_reward
-                batch.get("next").get(group).set("episode_reward", episode_reward)
-                batch.get(group).set("episode_reward", episode_reward)
-
-        elif perturbation_type == "bernoulli":
-            done = batch.get("done")
-            for group in self.group_map.keys():
-                # 1. Get the true reward
-                reward = batch.get("next").get(group).get("reward")  # [B, T, A, 1]
-
-                # 2. Determine WHICH steps/agents get attacked (e.g., flip_prob = 0.15 for a 15% attack rate)
-                attack_mask = torch.bernoulli(torch.full_like(reward, flip_prob)) # 1 if attacked, 0 if safe
-
-                # 3. Create the extreme outlier values (+10 or -10 randomly)
-                sign_flip = torch.bernoulli(torch.full_like(reward, 0.5)) # 50/50 chance of + or -
-                outlier_values = 3.0 * (1.0 - 2.0 * sign_flip) # Overwrites to +10.0 or -10.0
-
-                # 4. Mix the clean reward with the adversarial outliers
-                # If attack_mask is 1, take outlier_values. If 0, keep true reward.
-                reward_perturbed = (attack_mask * outlier_values) + ((1.0 - attack_mask) * reward)
-
-                # 5. Set perturbed reward back
-                batch.get("next").get(group).set("reward", reward_perturbed)
-
-                # 6. Recompute cumulative episode_reward with reset at done
-                episode_reward = torch.zeros_like(reward_perturbed)
-                cumulative = torch.zeros_like(reward_perturbed[:, 0])  # [B, A, 1]
-                done_broadcast = done.unsqueeze(2).expand(-1, -1, reward.shape[2], -1)
-
-                for t in range(reward_perturbed.shape[1]):
-                    cumulative = cumulative * (~done_broadcast[:, t]) + reward_perturbed[:, t]
-                    episode_reward[:, t] = cumulative
-
-                # 7. Store recomputed episode_reward
-                batch.get("next").get(group).set("episode_reward", episode_reward)
-                batch.get(group).set("episode_reward", episode_reward)
-        #Under construction
-        elif perturbation_type == "uniform":
-            batch.get("next").get("pursuer").set("reward", torch.zeros_like(batch.get("next").get("pursuer").get("reward")))
-            batch.get("next").get("pursuer").set("episode_reward", torch.zeros_like(batch.get("next").get("pursuer").get("episode_reward")))
-            for group in self.group_map.keys():
-                batch.get(group).set("episode_reward", torch.zeros_like(batch.get(group).get("episode_reward")))
-        else:
-            raise ValueError(f"Unknown perturbation type: {perturbation_type}")
-        return batch
-    
-
-        # Warm-up loop and main training loop separated
-
-    def predict_grouping(self, batch):
-        if self.task_name == "pursuit":
-            obs = batch["pursuer"]["observation"]  # [B, T, A, 7, 7, 3]
-            act = batch["pursuer"]["action"]       # [B, T, A]  (discrete)
-
-            # Reshape correctly
-            B, T, A = obs.shape[:3]
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            obs = obs.reshape(-1, 3, 7, 7)
-            # One-hot encode actions
-            act_dim = 5
-            act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
-        if self.task_name == "simple_spread":
-            obs_size = self.task.config['N'] * 6
-            obs = batch["agent"]["observation"]  # [B, T, A, obs_size]
-            act = batch["agent"]["action"]       # [B, T, A, 5] (continuous)
-
-            # Reshape correctly
-            B, T, A = obs.shape[:3]
-            obs = obs.reshape(-1, obs_size)
-            # One-hot encode actions
-            act_dim = 5
-            act = act.reshape(-1, act_dim)  # [B*T*A, act_dim]
-        if self.task_name == "adversarial_pursuit":
-            obs = batch["predator"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["predator"]["action"]       # [B, T, A]  (discrete)
-
-            # Reshape correctly
-            B, T, A = obs.shape[:3]
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            obs = obs.reshape(-1, 5, 10, 10)
-            # One-hot encode actions
-            act_dim = 13
-            act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
-        if self.task_name == "battle":
-            obs = batch["red"]["observation"]  # [B, T, A, 10, 10, 5]
-            act = batch["red"]["action"]       # [B, T, A]  (discrete)
-
-            # Reshape correctly
-            B, T, A = obs.shape[:3]
-            obs = obs.permute(0, 1, 2, 5, 3, 4)  # [B, T, A, C, H, W]
-            obs = obs.reshape(-1, 5, 13, 13)
-            # One-hot encode actions
-            act_dim = 21
-            act = F.one_hot(act.to(torch.long), num_classes=act_dim).reshape(-1, act_dim)  # [B*T*A, act_dim]
-        # Run model
-        with torch.no_grad():
-            logits = self.grouping_model(obs, act)  # [B*T*A, 3]
-            group_idx = logits.argmax(dim=-1).view(B, T, A)
-            return F.one_hot(group_idx, num_classes=logits.shape[-1]).float()  # [B, T, A, 3]
-
-
-        with torch.no_grad():
-            logits = self.grouping_model(obs.view(-1, obs.shape[-1]), act.view(-1, act.shape[-1]))
-            group_idx = logits.argmax(dim=-1).view(B, T, A)
-            # Convert to one-hot tensor of shape [B, T, A, 3]
-            return F.one_hot(group_idx, num_classes=self.grouping_model.shape[-1]).float()
-
+        The policies are trained on the clean rewards during the warm-up so that the
+        grouping model sees a realistic state distribution. Afterwards the task,
+        policies, buffers and collector are re-initialised (with the experiment seed),
+        so policy learning starts from the same initialisation as runs without warm-up.
+        """
+        iterator, reset_batch = self._new_collection_state()
+        for _ in tqdm(range(self.config.warmup_iters), desc="grouping warm-up"):
+            batch, reset_batch = self._collect_batch(iterator, reset_batch)
+            batch = batch.detach()
+            logs = self.reward_robustness.warmup_update(batch)
+            self._train_on_batch(batch, current_frames=batch.numel(), log=False)
+        if self.config.warmup_iters > 0:
+            self.logger.log(
+                {f"reward_robustness/{k}": v for k, v in logs.items()}, step=0
+            )
+        self._setup_reset()
 
     def _collection_loop(self):
+        if self.reward_robustness.needs_warmup and self.n_iters_performed == 0:
+            self._grouping_warmup()
+
         pbar = tqdm(
             initial=self.n_iters_performed,
             total=self.config.get_max_n_iters(self.on_policy),
-         )
+        )
+        iterator, reset_batch = self._new_collection_state()
 
-        warmup_iters = self.config.warmup_iters
-        warmup_data = []
-        if self.task_name == "pursuit":
-            self.grouping_model = PursuitGroupingCNN().to(self.config.train_device)
-        if self.task_name == "simple_spread":
-            obs_size = self.task.config['N'] * 6
-            self.grouping_model = SpreadGroupingMLP(obs_size).to(self.config.train_device)
-        if self.task_name == "adversarial_pursuit":
-            self.grouping_model = AdversarialPursuitPredatorCNN().to(self.config.train_device)
-        if self.task_name == "battle":
-            self.grouping_model = BattleBlueCNN().to(self.config.train_device)
-        if not self.config.collect_with_grad:
-            iterator = iter(self.collector)
-        else:
-            reset_batch = self.rollout_env.reset()
-        
-
-        if self.config.train_grouping_warmup:
-            # === Warm-up Phase ===
-            for warmup_step in range(warmup_iters):
-                if not self.config.collect_with_grad:
-                    batch = next(iterator)
-                else:
-                    with set_exploration_type(ExplorationType.RANDOM):
-                        batch = self.rollout_env.rollout(
-                            max_steps=-(
-                                -self.config.collected_frames_per_batch(self.on_policy)
-                                // self.rollout_env.batch_size.numel()
-                            ),
-                            policy=self.policy,
-                            break_when_any_done=False,
-                            auto_reset=False,
-                            tensordict=reset_batch,
-                        )
-                        reset_batch = step_mdp(
-                            batch[..., -1],
-                            reward_keys=self.rollout_env.reward_keys,
-                            action_keys=self.rollout_env.action_keys,
-                            done_keys=self.rollout_env.done_keys,
-                         )
-                        warmup_data.append(batch.detach())
-                        self._on_batch_collected(batch)
-                batch = batch.detach()
-                for group in self.train_group_map.keys():
-                    group_batch = batch.exclude(*self._get_excluded_keys(group))
-                    group_batch = self.algorithm.process_batch(group, group_batch)
-                    if not self.algorithm.has_rnn:
-                        group_batch = group_batch.reshape(-1)
-                    group_buffer = self.replay_buffers[group]
-                    group_buffer.extend(group_batch.to(group_buffer.storage.device))
-                    for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                        for _ in range(
-                            -(
-                                -self.config.train_batch_size(self.on_policy)
-                                // self.config.train_minibatch_size(self.on_policy)
-                            )
-                        ):
-                            self._optimizer_loop(group)
-                for group in self.train_group_map.keys():
-                    batch[group]["original_reward"] = batch["next"][group]["reward"].clone()
-                self.train_grouping_model(batch)
-
-                # Train grouping model after warm-up
-
-
-        # Reset policy to prevent bleedover
-        self._setup_reset()
-        if not self.config.collect_with_grad:
-            iterator = iter(self.collector)
-        else:
-            reset_batch = self.rollout_env.reset()
-
-        # === Main Training Phase ===
-        for _ in range(self.config.get_max_n_iters(self.on_policy)):
+        # Training/collection iterations
+        for _ in range(
+            self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
+        ):
             iteration_start = time.time()
-
-            if not self.config.collect_with_grad:
-                batch = next(iterator)
-            else:
-                with set_exploration_type(ExplorationType.RANDOM):
-                    batch = self.rollout_env.rollout(
-                        max_steps=-(
-                            -self.config.collected_frames_per_batch(self.on_policy)
-                            // self.rollout_env.batch_size.numel()
-                        ),
-                        policy=self.policy,
-                        break_when_any_done=False,
-                        auto_reset=False,
-                        tensordict=reset_batch,
-                    )
-                    reset_batch = step_mdp(
-                        batch[..., -1],
-                        reward_keys=self.rollout_env.reward_keys,
-                        action_keys=self.rollout_env.action_keys,
-                        done_keys=self.rollout_env.done_keys,
-                     )
-            #Retain original reward
-            for group in self.group_map.keys():
-                batch[group]["original_reward"] = batch["next"][group]["reward"].clone()
-            if self.config.reward_perturbation:
-                batch = self._apply_reward_perturbation(
-                    batch,
-                    self.config.reward_perturbation_type,
-                    self.config.reward_perturbation_stdev,
-                    self.config.reward_perturbation_flip_prob
-                 )
-            if self.config.oracle_grouping:
-                # Use oracle grouping if enabled
-                grouping_tensor = oracle_grouping(batch, self.task_name, self.config.num_groups)
-            else:
-                if self.config.train_grouping_no_warmup:
-                    self.train_grouping_model(batch)
-                grouping_tensor = self.predict_grouping(batch)  # Group per timestep
-            if self.config.evaluate_grouping:
-                for group in self.train_group_map.keys():
-                    self.logger.log_grouping(
-                        group,
-                        oracle_grouping(batch, self.task_name),
-                        grouping_tensor,
-                        step=self.n_iters_performed,
-                    )
-
-
-            if self.config.pof_enable:
-                batch = grouping_reward_averaging(batch, grouping_tensor, self.task_name, self.config.reward_perturbation_type)
-
+            batch, reset_batch = self._collect_batch(iterator, reset_batch)
             collection_time = time.time() - iteration_start
+
+            # Reward perturbation and grouped consensus correction (GR²-MARL)
+            grouping_start = time.time()
+            batch, robustness_logs = self.reward_robustness.process(batch)
+            grouping_time = time.time() - grouping_start
+
+            # Logging collection
             current_frames = batch.numel()
             self.total_frames += current_frames
             self.mean_return = self.logger.log_collection(
@@ -1050,45 +833,20 @@ class Experiment(CallbackNotifier):
                 task=self.task,
                 step=self.n_iters_performed,
             )
+            if robustness_logs:
+                self.logger.log(robustness_logs, step=self.n_iters_performed)
             pbar.set_description(f"mean return = {self.mean_return}", refresh=False)
 
+            # Callback
             self._on_batch_collected(batch)
             batch = batch.detach()
 
-            for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
-                group_batch = self.algorithm.process_batch(group, group_batch)
-                if not self.algorithm.has_rnn:
-                    group_batch = group_batch.reshape(-1)
+            # Training
+            training_start = time.time()
+            self._train_on_batch(batch, current_frames)
+            training_time = time.time() - training_start
 
-                group_buffer = self.replay_buffers[group]
-                group_buffer.extend(group_batch.to(group_buffer.storage.device))
-
-                training_tds = []
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                    for _ in range(
-                        -(
-                            -self.config.train_batch_size(self.on_policy)
-                            // self.config.train_minibatch_size(self.on_policy)
-                        )
-                    ):
-                        training_tds.append(self._optimizer_loop(group))
-                training_td = torch.stack(training_tds)
-                self.logger.log_training(group, training_td, step=self.n_iters_performed)
-                self._on_train_end(training_td, group)
-
-                if isinstance(self.group_policies[group], TensorDictSequential):
-                    explore_layer = self.group_policies[group][-1]
-                else:
-                    explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):
-                    explore_layer.step(current_frames)
-
-            if not self.config.collect_with_grad:
-                self.collector.update_policy_weights_()
-
-            training_time = time.time() - iteration_start
-
+            # Evaluation
             if (
                 self.config.evaluation
                 and (
@@ -1099,11 +857,13 @@ class Experiment(CallbackNotifier):
             ):
                 self._evaluation_loop()
 
+            # End of step
             iteration_time = time.time() - iteration_start
             self.total_time += iteration_time
             self.logger.log(
                 {
                     "timers/collection_time": collection_time,
+                    "timers/grouping_time": grouping_time,
                     "timers/training_time": training_time,
                     "timers/iteration_time": iteration_time,
                     "timers/total_time": self.total_time,
@@ -1115,164 +875,17 @@ class Experiment(CallbackNotifier):
             )
             self.n_iters_performed += 1
             self.logger.commit()
-
             if (
                 self.config.checkpoint_interval > 0
                 and self.total_frames % self.config.checkpoint_interval == 0
             ):
                 self._save_experiment()
+            pbar.update()
 
         if self.config.checkpoint_at_end:
             self._save_experiment()
         self.logger.log_evaluation_table()
         self.close()
-
-
-    # def _collection_loop(self):
-    #     pbar = tqdm(
-    #         initial=self.n_iters_performed,
-    #         total=self.config.get_max_n_iters(self.on_policy),
-    #     )
-    #     if not self.config.collect_with_grad:
-    #         iterator = iter(self.collector)
-    #     else:
-    #         reset_batch = self.rollout_env.reset()
-
-    #     # Training/collection iterations
-    #     for _ in range(
-    #         self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
-    #     ):
-    #         iteration_start = time.time()
-    #         if not self.config.collect_with_grad:
-    #             batch = next(iterator)
-    #         else:
-    #             with set_exploration_type(ExplorationType.RANDOM):
-    #                 batch = self.rollout_env.rollout(
-    #                     max_steps=-(
-    #                         -self.config.collected_frames_per_batch(self.on_policy)
-    #                         // self.rollout_env.batch_size.numel()
-    #                     ),
-    #                     policy=self.policy,
-    #                     break_when_any_done=False,
-    #                     auto_reset=False,
-    #                     tensordict=reset_batch,
-    #                 )
-    #                 reset_batch = step_mdp(
-    #                     batch[..., -1],
-    #                     reward_keys=self.rollout_env.reward_keys,
-    #                     action_keys=self.rollout_env.action_keys,
-    #                     done_keys=self.rollout_env.done_keys,
-    #                 )
-    #         grouping_tensor = pursuit_grouping(batch)
-
-    #         if self.config.reward_perturbation:
-    #             batch = self._apply_reward_perturbation(
-    #                 batch,
-    #                 self.config.reward_perturbation_type,
-    #                 self.config.reward_perturbation_stdev,
-    #                 self.config.reward_perturbation_flip_prob
-    #             )
-            
-    #         if self.config.pof_enable:
-    #             batch = grouping_reward_averaging(batch, grouping_tensor)
-            
-    #         # Logging collection
-    #         collection_time = time.time() - iteration_start
-    #         current_frames = batch.numel()
-    #         self.total_frames += current_frames
-    #         self.mean_return = self.logger.log_collection(
-    #             batch,
-    #             total_frames=self.total_frames,
-    #             task=self.task,
-    #             step=self.n_iters_performed,
-    #         )
-    #         pbar.set_description(f"mean return = {self.mean_return}", refresh=False)
-
-    #         # Callback
-    #         self._on_batch_collected(batch)
-    #         batch = batch.detach()
-
-    #         # Loop over groups
-    #         training_start = time.time()
-    #         for group in self.train_group_map.keys():
-    #             group_batch = batch.exclude(*self._get_excluded_keys(group))
-    #             group_batch = self.algorithm.process_batch(group, group_batch)
-    #             if not self.algorithm.has_rnn:
-    #                 group_batch = group_batch.reshape(-1)
-
-    #             group_buffer = self.replay_buffers[group]
-    #             group_buffer.extend(group_batch.to(group_buffer.storage.device))
-
-    #             training_tds = []
-    #             for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-    #                 for _ in range(
-    #                     -(
-    #                         -self.config.train_batch_size(self.on_policy)
-    #                         // self.config.train_minibatch_size(self.on_policy)
-    #                     )
-    #                 ):
-    #                     training_tds.append(self._optimizer_loop(group))
-    #             training_td = torch.stack(training_tds)
-    #             self.logger.log_training(
-    #                 group, training_td, step=self.n_iters_performed
-    #             )
-
-    #             # Callback
-    #             self._on_train_end(training_td, group)
-
-    #             # Exploration update
-    #             if isinstance(self.group_policies[group], TensorDictSequential):
-    #                 explore_layer = self.group_policies[group][-1]
-    #             else:
-    #                 explore_layer = self.group_policies[group]
-    #             if hasattr(explore_layer, "step"):  # Step exploration annealing
-    #                 explore_layer.step(current_frames)
-
-    #         # Update policy in collector
-    #         if not self.config.collect_with_grad:
-    #             self.collector.update_policy_weights_()
-
-    #         # Training timer
-    #         training_time = time.time() - training_start
-
-    #         # Evaluation
-    #         if (
-    #             self.config.evaluation
-    #             and (
-    #                 self.total_frames % self.config.evaluation_interval == 0
-    #                 or self.n_iters_performed == 0
-    #             )
-    #             and (len(self.config.loggers) or self.config.create_json)
-    #         ):
-    #             self._evaluation_loop()
-
-    #         # End of step
-    #         iteration_time = time.time() - iteration_start
-    #         self.total_time += iteration_time
-    #         self.logger.log(
-    #             {
-    #                 "timers/collection_time": collection_time,
-    #                 "timers/training_time": training_time,
-    #                 "timers/iteration_time": iteration_time,
-    #                 "timers/total_time": self.total_time,
-    #                 "counters/current_frames": current_frames,
-    #                 "counters/total_frames": self.total_frames,
-    #                 "counters/iter": self.n_iters_performed,
-    #             },
-    #             step=self.n_iters_performed,
-    #         )
-    #         self.n_iters_performed += 1
-    #         self.logger.commit()
-    #         if (
-    #             self.config.checkpoint_interval > 0
-    #             and self.total_frames % self.config.checkpoint_interval == 0
-    #         ):
-    #             self._save_experiment()
-    #         pbar.update()
-
-    #     if self.config.checkpoint_at_end:
-    #         self._save_experiment()
-    #     self.close()
 
     def close(self):
         """Close the experiment."""
@@ -1429,6 +1042,7 @@ class Experiment(CallbackNotifier):
                 f"buffer_{k}": item.state_dict() if len(item) else None
                 for k, item in self.replay_buffers.items()
             },
+            reward_robustness=self.reward_robustness.state_dict(),
         )
         if not self.config.collect_with_grad:
             state_dict.update({"collector": self.collector.state_dict()})
@@ -1449,6 +1063,8 @@ class Experiment(CallbackNotifier):
                 )
         if not self.config.collect_with_grad:
             self.collector.load_state_dict(state_dict["collector"])
+        if "reward_robustness" in state_dict:
+            self.reward_robustness.load_state_dict(state_dict["reward_robustness"])
         self.total_time = state_dict["state"]["total_time"]
         self.total_frames = state_dict["state"]["total_frames"]
         self.n_iters_performed = state_dict["state"]["n_iters_performed"]

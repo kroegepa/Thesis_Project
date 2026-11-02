@@ -38,23 +38,64 @@ polyak_tau: 0.005
 # If soft_target_update is False, this is the frequency of the hard target updates in terms of n_optimizer_steps
 hard_target_update_frequency: 5
 
-# Wheter to include reward attack
+# ---------------------------------------------------------------------------
+# Reward perturbation (kernel K, applied independently to every agent's reward)
+# ---------------------------------------------------------------------------
+# Whether to perturb the training rewards (evaluation always uses true rewards)
 reward_perturbation: False
-# The reward attack type, options are: "normal", "bernoulli"
+# The perturbation kernel: "normal" (additive zero-mean Gaussian) or "bernoulli" (outliers)
 reward_perturbation_type: "normal"
-# The reward attack standard deviation, relevant for gaussian
+# Standard deviation of the "normal" kernel
 reward_perturbation_stdev: 0.5
-# The reward flip probability, relevant for bernoulli
+# Probability that a reward is replaced by an outlier ("bernoulli" kernel)
 reward_perturbation_flip_prob: 0.2
+# Outliers are +/- this value ("bernoulli" kernel)
+reward_perturbation_outlier_value: 10.0
 
-#Whether to include power of friendship(pfo) reward robustness mechanism
-pof_enable: False
-#Whether to use original reward for grouping
-oracle_grouping: False
-#Whether to evaluate the grouping
-evaluate_grouping: False
-#Number of groups
+# ---------------------------------------------------------------------------
+# Grouped-reward robustness (GR^2-MARL), see benchmarl/reward_robustness
+# ---------------------------------------------------------------------------
+# How agents are grouped for the consensus correction:
+#   none              no correction (No-Correction baseline)
+#   oracle            levels of the true reward (upper bound)
+#   global            all agents in a single group (ablation)
+#   warmup            classifier trained on oracle labels during a clean warm-up, then frozen
+#   gmm               classifier trained online on GMM clusters of the noisy rewards (paper No-Warmup)
+#   reward_model      warm-up free: regress noisy rewards on (o, a[, o']) and group agents with
+#                     similar predicted rewards (see reward_model_* below)
+#   reward_model_only baseline: replace rewards with the learned reward model
+grouping_method: "none"
+# Consensus function C: "mean", "median", "trimmed_mean" or "auto" (mean for "normal", median otherwise)
+consensus: "auto"
+# Fraction trimmed from each side by "trimmed_mean"
+consensus_trim: 0.2
+# Number of groups K (oracle levels, classifier outputs, k-means clusters)
 num_groups: 3
+# Log grouping quality and reward-error diagnostics (uses the true rewards, for analysis only)
+evaluate_grouping: False
+# Number of warm-up iterations on clean rewards (only used by grouping_method=warmup)
+warmup_iters: 50
+# Training of the grouping network, per iteration (per warm-up iteration for "warmup")
+grouping_epochs: 35
+grouping_lr: 0.001
+grouping_batch_size: 512
+# Also feed the next observation o' to the grouping network (rewards are R(s, a, s'))
+grouping_use_next_obs: False
+# Compute the groups of an iteration with the parameters fitted on previous iterations only, so the
+# grouping does not depend on the current noise realisation. False reproduces the original No-Warmup.
+grouping_out_of_sample: True
+# Order GMM components by their mean so that labels are consistent across batches ("gmm").
+# False reproduces the original No-Warmup implementation.
+grouping_gmm_sort: True
+# Similarity tolerance epsilon (reward units) for reward_model_assign = "epsilon" / "kernel"
+grouping_epsilon: 0.5
+# Reward-model loss: "mse", "huber", "l1" or "auto" (mse for "normal", l1 otherwise)
+reward_model_loss: "auto"
+# How agents are grouped from predicted rewards: "kmeans" (num_groups clusters), "epsilon"
+# (per-timestep epsilon-gap clustering), "kernel" (soft weights with bandwidth epsilon) or "global"
+reward_model_assign: "kmeans"
+# Residual consensus: apply the consensus to r~ - f(o, a) and add f(o, a) back
+reward_model_residual: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
@@ -68,10 +109,6 @@ exploration_anneal_frames: null
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
 max_n_frames: 1_500_000
-
-train_grouping_no_warmup: False
-train_grouping_warmup: False
-warmup_iters: 50
 
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 3000
