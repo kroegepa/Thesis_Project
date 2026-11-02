@@ -36,12 +36,16 @@ class Assignment:
             ε-similarity of residuals.
         replace: per-agent rewards ``[..., A]`` that replace the observed rewards
             (used by the reward-model-only baseline).
+        active: optional bool ``[..., A]``. Inactive agents keep their observed reward
+            and do not contribute to anyone's consensus (e.g. agents for which the
+            grouper is not confident).
     """
 
     labels: Optional[torch.Tensor] = None
     weights: Optional[torch.Tensor] = None
     offset: Optional[torch.Tensor] = None
     replace: Optional[torch.Tensor] = None
+    active: Optional[torch.Tensor] = None
 
 
 def _num_labels(labels: torch.Tensor) -> int:
@@ -126,6 +130,8 @@ def apply_consensus(
     """Compute the corrected rewards ``r^`` (eq. 3) from observed rewards ``[..., A]``."""
     if mask is None:
         mask = torch.ones_like(reward, dtype=torch.bool)
+    if assignment.active is not None:
+        mask = mask & assignment.active
     if assignment.replace is not None:
         return torch.where(mask, assignment.replace.to(reward.dtype), reward)
 

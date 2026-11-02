@@ -84,6 +84,11 @@ _ALL_VARIANTS = {
 }
 FAMILIES = {
     "rm_next": ({"use_next_obs": True}, _ALL_VARIANTS),
+    # Bootstrapped 5-head ensemble: agents with predictive std > epsilon stay ungrouped
+    "rm_next_ens": (
+        {"use_next_obs": True, "reward_model_heads": 5},
+        {k: _ALL_VARIANTS[k] for k in ["kmeans", "eps0.5", "kernel0.5", "global_resid", "only"]},
+    ),
     "rm": (
         {"use_next_obs": False},
         {k: _ALL_VARIANTS[k] for k in ["kmeans", "kmeans_insample", "only"]},
@@ -208,19 +213,29 @@ def run_family(name, args, sigma, stream, spec):
     for i, data in enumerate(stream):
         _perturb(data, args, sigma, i)
         evaluate = i % 2 == 1
-        pred_out = grouper.predict_rewards(data) if evaluate and grouper.n_updates else None
+        pred_out, std_out = (
+            grouper.predict_mean_std(data) if evaluate and grouper.n_updates else (None, None)
+        )
         grouper.update(data)
-        pred_in = grouper.predict_rewards(data) if evaluate and need_insample else None
+        pred_in, std_in = (
+            grouper.predict_mean_std(data) if evaluate and need_insample else (None, None)
+        )
         if not evaluate:
             continue
         levels = oracle_labels(data.true_reward, spec, args.num_groups, data.mask)
         for v, (mode, kw, in_sample) in variants.items():
-            pred = pred_in if in_sample else pred_out
+            pred, std = (pred_in, std_in) if in_sample else (pred_out, std_out)
             if pred is None:
                 assignment = Assignment()
             else:
+                eps = kw.get("epsilon", grouper.cfg.epsilon)
                 assignment = assignment_from_predictions(
-                    pred, data.mask, mode=mode, num_groups=args.num_groups, **kw
+                    pred,
+                    data.mask,
+                    mode=mode,
+                    num_groups=args.num_groups,
+                    confident=None if std is None else std <= eps,
+                    **kw,
                 )
             corrected = apply_consensus(data.reward, assignment, data.mask, method=args.consensus)
             accs[v].add(data.true_reward, corrected, levels, assignment.labels)

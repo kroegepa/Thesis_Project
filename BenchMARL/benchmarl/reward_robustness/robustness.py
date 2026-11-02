@@ -80,6 +80,7 @@ class RewardRobustness:
             ),
             reward_model_assign=config.reward_model_assign,
             reward_model_residual=config.reward_model_residual,
+            reward_model_heads=config.reward_model_heads,
             epsilon=config.grouping_epsilon,
         )
         self.grouper: Optional[Grouper] = (

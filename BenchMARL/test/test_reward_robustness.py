@@ -86,6 +86,15 @@ class TestConsensus:
         rep = torch.tensor([[5.0, 6.0]])
         assert torch.equal(apply_consensus(r, Assignment(replace=rep), mask), rep)
 
+    def test_inactive_agents_are_left_alone(self):
+        r = torch.tensor([[1.0, 3.0, 100.0]])
+        labels = torch.zeros(1, 3, dtype=torch.long)
+        active = torch.tensor([[True, True, False]])
+        out = apply_consensus(r, Assignment(labels=labels, active=active))
+        assert torch.allclose(out, torch.tensor([[2.0, 2.0, 100.0]]))
+        out = apply_consensus(r, Assignment(replace=torch.zeros(1, 3), active=active))
+        assert torch.allclose(out, torch.tensor([[0.0, 0.0, 100.0]]))
+
     def test_oracle_mean_is_unbiased_and_reduces_variance(self):
         torch.manual_seed(0)
         n, a, sigma = 20000, 8, 2.0
@@ -214,6 +223,23 @@ class TestGroupers:
             truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
             if assignment.labels is not None:
                 assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.9
+
+    def test_ensemble_reward_model_gates_on_confidence(self):
+        torch.manual_seed(0)
+        cfg = GroupingConfig(
+            method="reward_model", epochs=3, reward_model_heads=4, reward_model_assign="epsilon"
+        )
+        grouper = make_grouper(cfg, self.spec)
+        for seed in range(3):
+            _, logs = grouper(_fake_pursuit_data(seed=seed))
+        assert 0.0 <= logs["grouper/confident_frac"] <= 1.0
+        data = _fake_pursuit_data(seed=7)
+        assignment, _ = grouper(data)
+        assert assignment.active is not None and assignment.active.dtype == torch.bool
+        # Agents that are not confident are never grouped
+        assert (assignment.labels[~assignment.active] == -1).all()
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        assert torch.equal(corrected[~assignment.active], data.reward[~assignment.active])
 
     def test_warmup_grouper(self):
         torch.manual_seed(0)

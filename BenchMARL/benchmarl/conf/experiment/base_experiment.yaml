@@ -98,6 +98,10 @@ reward_model_loss: "auto"
 reward_model_assign: "kmeans"
 # Residual consensus: apply the consensus to r~ - f(o, a) and add f(o, a) back
 reward_model_residual: False
+# Number of bootstrapped heads of the reward model. With > 1 heads, agents whose predictive std
+# exceeds grouping_epsilon are not grouped (they keep their own reward), so an unsure model falls
+# back to no correction instead of merging agents with different rewards
+reward_model_heads: 1
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8

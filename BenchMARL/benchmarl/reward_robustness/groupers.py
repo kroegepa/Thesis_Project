@@ -69,6 +69,7 @@ class GroupingConfig:
     reward_model_loss: str = "mse"
     reward_model_assign: str = "kmeans"
     reward_model_residual: bool = False
+    reward_model_heads: int = 1
     epsilon: float = 0.5
 
 
@@ -315,9 +316,14 @@ class RewardModelGrouper(_NetworkGrouper):
 
     ``reward_model_residual``: consensus is applied to residuals ``r~ - f`` and the
     prediction is added back, so only the *model errors* need to be ε-similar.
+
+    ``reward_model_heads > 1``: the model is a bootstrapped ensemble (shared encoder,
+    one output head per member, each trained with Poisson(1) bootstrap weights). Agents
+    whose predictive std across heads exceeds ``epsilon`` are left ungrouped and keep
+    their own (unbiased) reward. An untrained or unsure model therefore falls back to
+    no correction instead of grouping agents with different rewards.
     """
 
-    out_dim = 1
     replace_with_prediction = False
 
     def __init__(self, cfg: GroupingConfig, spec: TaskSpec, device="cpu"):
@@ -326,33 +332,53 @@ class RewardModelGrouper(_NetworkGrouper):
             raise ValueError(
                 f"Unknown reward_model_loss '{cfg.reward_model_loss}', expected {list(_LOSSES)}"
             )
-        self.loss = _LOSSES[cfg.reward_model_loss]()
+        self.loss = _LOSSES[cfg.reward_model_loss](reduction="none")
+        self.out_dim = max(cfg.reward_model_heads, 1)
+
+    def predict_mean_std(self, data: GroupData) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Mean prediction ``[..., A]`` and, for ensembles, the std across heads."""
+        out = self._predict(data)
+        if self.out_dim == 1:
+            return out.squeeze(-1), None
+        return out.mean(-1), out.std(-1)
 
     def predict_rewards(self, data: GroupData) -> torch.Tensor:
-        return self._predict(data).squeeze(-1)
+        return self.predict_mean_std(data)[0]
+
+    def _loss(self, out: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        per_head = self.loss(out, y.unsqueeze(-1).expand_as(out))  # [N, heads]
+        if self.out_dim > 1:  # online bootstrap: each head sees a resampled batch
+            weights = torch.poisson(torch.ones_like(per_head))
+            return (per_head * weights).sum() / weights.sum().clamp(min=1)
+        return per_head.mean()
 
     def update(self, data: GroupData) -> Dict[str, float]:
         logs = {}
         if self.n_updates > 0:
             with torch.no_grad():
-                resid = (data.reward - self.predict_rewards(data))[data.mask]
+                pred, std = self.predict_mean_std(data)
+                resid = (data.reward - pred)[data.mask]
             # Out-of-sample residual variance: sigma^2 + model error (upper bound on sigma^2)
             logs["grouper/residual_var"] = resid.var().item() if resid.numel() > 1 else 0.0
-        logs["grouper/loss"] = self._fit(
-            data, data.reward, lambda out, y: self.loss(out.squeeze(-1), y), data.mask
-        )
+            if std is not None:
+                logs["grouper/confident_frac"] = (
+                    (std[data.mask] <= self.cfg.epsilon).float().mean().item()
+                )
+        logs["grouper/loss"] = self._fit(data, data.reward, self._loss, data.mask)
         return logs
 
     def assign(self, data: GroupData) -> Assignment:
         if self.n_updates == 0:
             return Assignment()  # nothing learned yet: leave rewards unchanged
+        pred, std = self.predict_mean_std(data)
         return assignment_from_predictions(
-            self.predict_rewards(data),
+            pred,
             data.mask,
             mode="replace" if self.replace_with_prediction else self.cfg.reward_model_assign,
             num_groups=self.cfg.num_groups,
             epsilon=self.cfg.epsilon,
             residual=self.cfg.reward_model_residual,
+            confident=None if std is None else std <= self.cfg.epsilon,
         )
 
 
@@ -363,27 +389,33 @@ def assignment_from_predictions(
     num_groups: int = 3,
     epsilon: float = 0.5,
     residual: bool = False,
+    confident: Optional[torch.Tensor] = None,
 ) -> Assignment:
     """Turn predicted rewards ``[..., A]`` into an :class:`Assignment`.
 
     ``mode``: ``kmeans`` | ``epsilon`` | ``kernel`` | ``global`` (see
     :class:`RewardModelGrouper`) or ``replace`` (use the predictions as rewards).
+    ``confident``: optional bool ``[..., A]``; other agents keep their observed reward.
     """
+    if confident is not None:
+        mask = mask & confident
     if mode == "replace":
-        return Assignment(replace=pred)
+        return Assignment(replace=pred, active=confident)
     offset = pred if residual else None
     none = torch.full_like(pred, -1, dtype=torch.long)
     if mode == "kmeans":
-        return Assignment(labels=kmeans_1d_labels(pred, num_groups, mask=mask), offset=offset)
-    if mode == "epsilon":
-        return Assignment(labels=epsilon_labels(pred, epsilon, mask=mask), offset=offset)
-    if mode == "global":
-        return Assignment(labels=torch.where(mask, torch.zeros_like(none), none), offset=offset)
-    if mode == "kernel":
+        labels = kmeans_1d_labels(pred, num_groups, mask=mask)
+    elif mode == "epsilon":
+        labels = epsilon_labels(pred, epsilon, mask=mask)
+    elif mode == "global":
+        labels = torch.where(mask, torch.zeros_like(none), none)
+    elif mode == "kernel":
         diff = pred.unsqueeze(-1) - pred.unsqueeze(-2)
         weights = torch.exp(-0.5 * (diff / max(epsilon, 1e-8)) ** 2)
-        return Assignment(weights=weights, offset=offset)
-    raise ValueError(f"Unknown reward_model_assign '{mode}'")
+        return Assignment(weights=weights, offset=offset, active=confident)
+    else:
+        raise ValueError(f"Unknown reward_model_assign '{mode}'")
+    return Assignment(labels=labels, offset=offset, active=confident)
 
 
 class RewardModelOnlyGrouper(RewardModelGrouper):
