@@ -267,10 +267,12 @@ class TestGroupers:
         cfg = GroupingConfig(method="reward_model", epochs=1)
         g1 = make_grouper(cfg, self.spec)
         g1(_fake_pursuit_data())
+        g1(_fake_pursuit_data(seed=1))  # second update computes the skill statistic
         g2 = make_grouper(cfg, self.spec)
         g2.load_state_dict(g1.state_dict())
         data = _fake_pursuit_data(seed=5)
         assert torch.allclose(g1.predict_rewards(data), g2.predict_rewards(data))
+        assert g2.skill_z == g1.skill_z and g2.n_updates == g1.n_updates
 
 
 def test_perturbation_kernels():

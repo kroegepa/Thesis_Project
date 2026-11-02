@@ -112,6 +112,18 @@ consensus then averages the *observed* rewards, so model error enters only throu
 misgrouping (Prop. 3′), not directly. Estimation error decays at the usual
 regression rate, roughly σ²/N_eff; the noise slows learning but does not bias it.
 
+*Practical caveats (from the offline benchmark and pilots).* Identifiability is
+asymptotic.
+- **Before the model has learned the rare reward events**, it predicts nearly the same
+  value for everyone. Similarity grouping on its predictions then degenerates into
+  global grouping, which erases exactly the rare-event credit (within-step contrast
+  ≈ 0). The code therefore only groups once f beats a constant predictor out of sample
+  (paired z-test on the previous batch). This is also a clean condition to state in
+  the paper: "group only when f is significantly informative".
+- **Noisy targets are easy to overfit.** With many epochs per batch, f is worse than a
+  constant out of sample, even though its ranking is still useful. One epoch per
+  iteration was enough.
+
 ---
 
 ## A4. Median consensus under Bernoulli corruption *(new)*

@@ -343,6 +343,17 @@ class RewardModelGrouper(_NetworkGrouper):
         self.out_dim = max(cfg.reward_model_heads, 1)
         self.skill_z: Optional[float] = None
 
+    def state_dict(self) -> Dict:
+        state = super().state_dict()
+        if state:
+            state["skill_z"] = self.skill_z
+        return state
+
+    def load_state_dict(self, state: Dict) -> None:
+        super().load_state_dict(state)
+        if state:
+            self.skill_z = state.get("skill_z")
+
     @property
     def skilled(self) -> bool:
         """Whether the model passed the out-of-sample skill test (always if disabled)."""
