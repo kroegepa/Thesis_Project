@@ -96,6 +96,13 @@ for. GMM clustering of noisy rewards has no such guarantee.
 4. Consensus is still taken over the **observed** rewards. The model only needs to rank
    rewards into levels, not predict them exactly, so model error enters only through
    misgrouping (Prop. 3), not as direct bias.
+5. **Skill gate** (`reward_model_min_skill_z`, default 3): only group once f beats a
+   constant predictor out of sample. Otherwise an untrained f predicts the same value
+   for everyone, and grouping collapses into global grouping (§3.2, findings 9–10).
+   Use **1 epoch per iteration**: more epochs overfit the noisy targets.
+
+Recommended configuration (from the benchmark below): o' as input, 1 epoch per
+iteration, kernel weights with ε = 0.5, skill gate z ≥ 3 (see `sweep.sh`).
 
 Optional **residual consensus** (`reward_model_residual=True`):
 `r^_i = f_i + C({r~_j − f_j : j ∈ G})`. This only needs the *residuals* to be
@@ -198,12 +205,21 @@ capture reward that drives learning. The benchmark therefore reports:
     which falls back to No-Correction.
 
 **End-to-end pilots (indicative only).**
-- Setting: 1 seed, Pursuit with 8 pursuers, σ = 2.5, 40 iterations of 3 000 frames.
+- Setting: 1–2 seeds, Pursuit with 8 pursuers, σ = 2.5, 40 iterations of 3 000 frames.
 - Reduced optimisation budget (lr 3e-4, 8 epochs × minibatch 400) to fit a CPU-only
   machine.
-- Metric: mean true training return per 5-iteration window.
+- Metric: mean true training return per 10-iteration window.
 
-PILOT_TABLE
+| run (seed) | it 0–9 | 10–19 | 20–29 | 30–39 |
+|---|---|---|---|---|
+| No-Correction (0) | −45.1 | −35.8 | −30.7 | −21.3 |
+| No-Correction (1) | −44.3 | −36.3 | −31.4 | −24.7 |
+| Oracle (0) | −40.4 | −25.1 | −11.6 | **−4.2** |
+| Paper No-Warmup: GMM classifier, 35 epochs, in-sample (0) | −41.3 | −33.3 | −30.3 | −31.7 |
+| Reward model, k-means, 5 epochs, no gate (0) | −41.5 | −37.5 | −32.9 | −20.8 |
+| Reward model, kernel ε=0.5, 5 epochs, no gate (0) | −43.4 | −40.1 | −36.5 | −28.3 |
+| Reward model, kernel, 1 epoch, skill gate (0): gate open 2/39 iterations | −44.7 | −44.2 | −43.2 | −38.7 |
+| Reward model, kernel, 1 epoch, skill gate (1): gate open from ~iteration 25 | −39.4 | −28.5 | −25.9 | −19.4 |
 
 - Oracle ≫ No-Correction, consistent with the paper.
 - The ungated reward-model groupers did not beat No-Correction end-to-end. The kernel
@@ -215,9 +231,19 @@ PILOT_TABLE
   ~0.2–0.3) and ended level with No-Correction.
 - The bootstrap-ensemble gate (`reward_model_heads=5`) did **not** catch this: the
   heads agree on "−0.1 everywhere", so the confident fraction was 1.0.
-- The out-of-sample **skill gate** (`reward_model_min_skill_z=3`, 1 epoch per
-  iteration) is the fix that the offline data supports. Its end-to-end pilots are in
-  the table above.
+- With the out-of-sample **skill gate** (1 epoch per iteration), the gate opened late or
+  not at all in these short 8-agent runs. Captures are rare under noise, so the model
+  needed ~25 iterations to beat a constant predictor (z rose from ≈0 to 8–14 in seed 1),
+  and in seed 0 it never got there. While the gate is shut, the method *is*
+  No-Correction.
+- **Seed variance dominates these pilots.** Gated seed 0 was effectively a third
+  No-Correction run, yet it finished at −38.7 vs −21.3 / −24.7 for the two real
+  No-Correction seeds. Only the oracle is clearly separated. No claim about the
+  warm-up-free methods can be made from these runs, in either direction.
+- What *is* solid comes from the diagnostics, not the returns: ungated similarity
+  grouping with an untrained model has within-step capture contrast ≈ 0 early on, i.e.
+  it acts like the global grouping that lost in the paper's Fig. 5. The kernel run's
+  final −28.3 is consistent with this but also within seed variance.
 - **Before claiming end-to-end gains, run the multi-seed sweep**
   (`examples/reward_robustness/sweep.sh`) on the cluster with the paper's budget.
 
