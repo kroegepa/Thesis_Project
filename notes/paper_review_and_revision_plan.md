@@ -122,7 +122,83 @@ capture reward that drives learning. The benchmark therefore reports:
 - **SNR** = signal × gap / noise;
 - pairwise grouping **precision/recall** against the oracle partition.
 
-RESULTS_PLACEHOLDER
+**Setup.**
+- Pursuit, 16 pursuers / 60 evaders (the paper's large setting).
+- A 20-iteration stream of MAPPO batches collected on clean rewards (capture rate rises
+  from 0.05% to ~2.5% of agent-steps).
+- Identical noise for every method. Learned groupers are updated on every batch;
+  metrics are computed on the odd batches. The warm-up classifier is trained on the
+  clean even batches (10 batches).
+- Budget deviations: classifiers use 10 epochs (not 35) and reward models 5 epochs.
+- Full table: `notes/offline_benchmark_results.md`. Selected rows, SNR (higher is
+  better), with within-step capture contrast in parentheses:
+
+| grouping | needs clean data | σ=1.5 | σ=2.5 | σ=3.5 |
+|---|---|---|---|---|
+| none (No-Correction) | – | 3.35 (1.00) | 2.02 (1.00) | 1.45 (1.00) |
+| oracle | always | 10.14 (1.00) | 6.11 (1.00) | 4.38 (1.00) |
+| global (Fig. 5 ablation) | no | 0 (0.00) | 0 (0.00) | 0 (0.00) |
+| GMM on current noisy rewards (No-Warmup limit) | no | 3.46 (0.92) | 1.85 (0.85) | 1.31 (0.85) |
+| warmup, input (o, a) (paper) | warm-up | – | 3.73 (0.64) | 2.72 (0.65) |
+| warmup, input (o, a, o') | warm-up | – | – | **3.95** (0.92) |
+| reward model, (o, a), k-means | no | – | – | 1.58 (0.40) |
+| reward model, (o, a, o'), k-means K=3 | no | 8.07 (0.79) | 3.68 (0.64) | 2.37 (0.59) |
+| reward model, (o, a, o'), ε-gap ε=0.5 | no | 9.49 (0.79) | 4.82 (0.71) | 3.07 (0.66) |
+| **reward model, (o, a, o'), kernel ε=0.5** | **no** | **9.84** (0.80) | **5.12** (0.71) | **3.32** (0.66) |
+| reward model, (o, a, o'), global + residual | no | 8.10 (0.73) | 4.35 (0.62) | 3.00 (0.58) |
+| reward-model-only baseline (Romoff-style) | no | 15.46 (0.73) | 9.11 (0.62) | 7.00 (0.58) |
+
+**Findings.**
+1. **The No-Warmup failure is reproduced and explained.** Grouping by GMM clusters of
+   the current noisy rewards barely reduces the noise (std 3.23 vs 3.50 at σ = 3.5), and
+   its SNR is *below* no correction. The consensus only quantises the noise (Prop. 4 in
+   `theory_additions.md`).
+2. **MSE and correlation are the wrong yardsticks.** Global grouping has lower MSE and
+   higher correlation than no correction, but within-step contrast 0: the capture reward
+   is shared by every agent of the step, so credit assignment is destroyed. That is
+   exactly why it lost to No-Correction in Fig. 5. Report contrast / SNR (now logged as
+   `reward_robustness/event_contrast`).
+3. **A reward model fitted only on noisy rewards gives useful groups.** With per-step
+   kernel or ε grouping on its predictions, it reaches SNR 3.3 at σ = 3.5. That is 2.3×
+   No-Correction and 76% of the oracle, and above the paper's Warmup classifier
+   (2.7), without clean data. At σ = 1.5 it reaches 97% of the oracle.
+4. **o' is important for every learned grouper.** Adding o' raises Warmup from 2.72 to
+   3.95 and the reward model (k-means) from 1.58 to 2.37. With equal inputs, the
+   warm-up-free reward model reaches ~84% of Warmup (3.32 vs 3.95). The remaining gap is
+   in capture contrast (0.66 vs 0.92): noisy targets make captures slower to learn. The
+   stream is only 20 iterations; full training is 250, so this gap should shrink.
+5. **How predictions become groups matters.** Global k-means with K = 3 is the weakest:
+   its middle cluster mixes capturers and non-capturers. Per-timestep ε/kernel grouping
+   is better. ε must be small relative to the action-relevant reward gap: ε = 2 loses
+   much of the contrast.
+6. **In-sample vs out-of-sample.** At 5 epochs, in-sample predictions are slightly better
+   (fresher model). Selection bias is catastrophic only when groups follow the noise
+   itself (point 1). Keep out-of-sample as the default, since it gives the exact
+   conditional guarantee, but report this trade-off honestly.
+7. **The reward-model-only baseline looks strong on SNR.** Its error is *systematic*
+   model error (it never averages out), whereas the consensus error is zero-mean noise,
+   so SNR flatters it. It must be in the end-to-end comparison: it is exactly the
+   baseline Reviewer 2 asked for.
+
+**End-to-end pilots (indicative only).**
+- Setting: 1 seed, Pursuit with 8 pursuers, σ = 2.5, 40 iterations of 3 000 frames.
+- Reduced optimisation budget (lr 3e-4, 8 epochs × minibatch 400) to fit a CPU-only
+  machine.
+- Metric: mean true training return per 5-iteration window.
+
+PILOT_TABLE
+
+- Oracle ≫ No-Correction, consistent with the paper.
+- The reward-model groupers do not yet beat No-Correction end-to-end. The diagnostics
+  show why: during the first ~15 iterations the model has not learned captures yet,
+  so it groups capturers with non-capturers. Capture contrast is only ~0.2–0.3 then
+  (vs ~0.65 later), which temporarily erases credit exactly when the policy most needs
+  it.
+- The confidence-gated ensemble (`reward_model_heads=5`: agents whose bootstrap std
+  exceeds ε stay ungrouped) is designed to fall back to No-Correction in that phase.
+- **Before claiming end-to-end gains, run the multi-seed sweep**
+  (`examples/reward_robustness/sweep.sh`) on the cluster with the paper's budget.
+
 
 ---
 
@@ -130,30 +206,37 @@ RESULTS_PLACEHOLDER
 
 ### 4.1 Method and experiments (highest impact)
 
-1. **Make the warm-up-free grouper the headline contribution** (R1, R2, R3). Replace
-   "No-Warmup" with the reward-model grouper, and keep the GMM variant as an ablation
-   that shows why noise-dependent grouping fails. Add the in-sample vs out-of-sample
-   ablation.
-2. **Add baselines** (R2, R3):
+1. **Replace "No-Warmup" with the reward-model grouper** (R1, R2, R3). Keep the GMM
+   variant as an ablation that shows why noise-dependent grouping fails (Prop. 4), and
+   add the in-sample vs out-of-sample ablation. Make this the headline contribution
+   only if the multi-seed sweep shows end-to-end gains over No-Correction. Offline it
+   recovers 76–97% of the oracle's SNR without clean data, but the single-seed pilots
+   were not yet better than No-Correction (§3.2). If it does not win end-to-end, the
+   honest framing is "noise-independent grouping is necessary, and here is how far
+   learned groupings get".
+2. **Feed o' to every learned grouper** (`grouping_use_next_obs=True`). Rewards are
+   R(s, a, s'); with o', Warmup's SNR rises from 2.72 to 3.95 at σ = 3.5. This cheap
+   change should strengthen the existing Warmup results.
+3. **Add baselines** (R2, R3):
    - reward-estimation baseline (`reward_model_only`, Romoff et al.);
    - global consensus with a robust statistic, i.e. the "Byzantine" aggregation R3
      mentions (`grouping_method=global consensus=median`);
    - the existing No-Correction and global-mean baselines.
-3. **Independent seeds and statistics** (R2, R3): ≥5 training seeds per cell. Report
+4. **Independent seeds and statistics** (R2, R3): ≥5 training seeds per cell. Report
    mean ± 95% bootstrap CI, or IQM with stratified bootstrap (rliable), on final return
    and AUC. Add Welch tests (or bootstrap CIs of the difference) against No-Correction.
    State clearly that shaded regions are CIs over training seeds.
-4. **Heterogeneous / role-differentiated rewards** (R3). Battle and Adversarial Pursuit
+5. **Heterogeneous / role-differentiated rewards** (R3). Battle and Adversarial Pursuit
    are already supported by the code (`TASK_SPECS`). A cheap controlled option is
    Pursuit with agent-specific capture rewards, with the agent id added to the reward
    model input; residual consensus is designed for this case.
-5. **Quantify degradation and cost** (R1):
+6. **Quantify degradation and cost** (R1):
    - a table of final return vs σ for each grouping method;
    - a scatter of final return vs grouping quality (signal / pairwise precision from
      the diagnostics), which directly validates Prop. 3;
    - the warm-up cost in frames and the grouping wall-clock overhead
      (`timers/grouping_time`).
-6. **Fig. 3:** recompute with pairwise precision/recall or ARI per timestep (not F1 of
+7. **Fig. 3:** recompute with pairwise precision/recall or ARI per timestep (not F1 of
    cluster ids).
 
 ### 4.2 Theory (R1, R3)

@@ -6,12 +6,12 @@
 # evaluation episodes within a run are NOT seeds.
 #
 # Usage:  bash sweep.sh pursuit16 [extra hydra overrides]   (or pursuit8 | spread5 | spread8)
-# Override e.g. METHODS="none,oracle,reward_model" SIGMAS="3.5" SEEDS="0,1,2" bash sweep.sh pursuit16
+# e.g.    SIGMAS="3.5" SEEDS="0,1,2" bash sweep.sh pursuit16 hydra/launcher=submitit_slurm
 set -euo pipefail
+set -f  # $COMMON is word-split on purpose; do not glob-expand e.g. [csv,wandb]
 cd "$(dirname "$0")/../.."
 
 SETTING=${1:-pursuit16}
-METHODS=${METHODS:-none,oracle,warmup,gmm,reward_model,reward_model_only}
 SIGMAS=${SIGMAS:-0.0,1.5,2.5,3.5}
 SEEDS=${SEEDS:-0,1,2,3,4}
 ALGO=${ALGO:-mappo}
@@ -28,16 +28,30 @@ esac
 
 # Settings reported in the paper (Sec. 5.2): 6000 frames/iteration, 1.5M frames,
 # evaluation every 20 iterations on 10 episodes.
-python benchmarl/run.py -m \
-  algorithm="$ALGO" $TASK $MODEL \
-  seed="$SEEDS" \
-  experiment.reward_perturbation=True \
-  experiment.reward_perturbation_stdev="$SIGMAS" \
-  experiment.grouping_method="$METHODS" \
-  experiment.on_policy_collected_frames_per_batch=6000 \
-  experiment.max_n_frames=1500000 \
-  experiment.evaluation_interval=120000 \
-  experiment.evaluate_grouping=True \
-  experiment.grouping_use_next_obs=True \
-  experiment.loggers="[csv,wandb]" \
-  "${@:2}"   # extra hydra overrides, e.g. hydra/launcher=submitit_slurm
+COMMON="algorithm=$ALGO $TASK $MODEL seed=$SEEDS
+  experiment.reward_perturbation=True experiment.reward_perturbation_stdev=$SIGMAS
+  experiment.on_policy_collected_frames_per_batch=6000 experiment.max_n_frames=1500000
+  experiment.evaluation_interval=120000 experiment.evaluate_grouping=True
+  experiment.loggers=[csv,wandb]"
+
+# 1) Baselines
+python benchmarl/run.py -m $COMMON experiment.grouping_method=none,oracle "${@:2}"
+
+# 1b) The paper's learned instances (35-epoch classifiers, as in the paper), with and
+#     without the next observation o' as grouping input
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=warmup,gmm experiment.grouping_epochs=35 \
+  experiment.grouping_use_next_obs=False,True "${@:2}"
+
+# 2) Warm-up-free reward-model instances (see notes/paper_review_and_revision_plan.md, Sec. 3)
+#    kernel consensus on predicted rewards, o' as input, 5 epochs/iteration; 1 head vs a
+#    5-head bootstrapped ensemble with confidence gating; plus the reward-model-only baseline.
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=reward_model,reward_model_only \
+  experiment.grouping_use_next_obs=True experiment.grouping_epochs=5 \
+  experiment.reward_model_assign=kernel experiment.grouping_epsilon=0.5 \
+  experiment.reward_model_heads=1,5 "${@:2}"
+
+# 3) Robust global aggregation baseline (Byzantine-style global median, Reviewer 3)
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=global experiment.consensus=median "${@:2}"
