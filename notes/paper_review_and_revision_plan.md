@@ -276,6 +276,82 @@ Suggested framing for the revision: replace the binary "warm-up vs no warm-up" w
 batches (hybrid) to the full warm-up. This answers Reviewer 1's cost/benefit question
 directly and turns "needs clean rewards" into "needs very few".
 
+### 3.4 A general route: certified consensus (no task engineering)
+
+Harness: `BenchMARL/examples/reward_robustness/explore_general_grouping.py`. It was
+tested on three settings with different reward structure:
+- **Pursuit**: rare, transient, situational events;
+- **SimpleSpread**: a dominant shared term, small collision differences;
+- **SimpleSpread "roles"**: two independent environments side by side, team B's
+  rewards shifted by +1. This is role-dependent heterogeneity that local observations
+  cannot reveal.
+
+Noise is Gaussian with **known σ**. Metrics are a per-agent decomposition into
+SNR on the shared objective, credit retention β (1 = within-step differences kept,
+0 = erased), and SNR on individual credit.
+
+**Three ideas that carry the method:**
+
+1. **Cross-agent second moments are noise-free.** With independent per-agent noise,
+   E[(r̃ᵢ − r̃ⱼ)²] − 2σ² = E[(rᵢ − rⱼ)²]. This is exactly the quantity in Assumption 1,
+   and it is unbiased with no features and no clean data. Over time it reveals
+   persistent (identity/role) structure. Use uncentred moments: role offsets are
+   invisible to covariances.
+2. **Certify grouping rules, not individual groups.** For any proposed rule (e.g.
+   "merge agents with close predicted rewards"), average that statistic over the
+   same-step pairs the rule merges. Measure it out of sample and lagged, and use the
+   rule only if UCB ≤ ε². The guarantee: with probability ≥ 1 − α, the mean squared
+   reward difference of merged pairs is ≤ ε², so the RMS consensus bias is ≤ ε (by
+   Jensen). This replaces the ad-hoc skill gate and directly answers "no guarantees
+   without a warm-up".
+3. **Proposals vs. restrictions.** The reward model *proposes* merges and situational
+   splits. Identity clusters only *restrict* merges. Rare large events are statistically
+   invisible in reward moments at high σ (erasing all events with rate p costs only
+   p·Δ² ≤ ε²), so merges must be vetted by a model that sees the situation.
+
+**Results.** Pooled over the 20-batch streams, so the certification delay is included.
+Each cell is the method / oracle / no-correction.
+
+| setting | certified from batch | SNR shared | β | SNR individual |
+|---|---|---|---|---|
+| SimpleSpread, σ=2.5 | 3 | 0.38 / 0.42 / 0.20 | – | – |
+| SimpleSpread, σ=3.5 | 5 | 0.24 / 0.30 / 0.14 | – | – |
+| roles, σ=2.5 | 4 | 0.25 / 0.34 / 0.16 | **0.98** (global, reward model: 0.03) | 0.36 / 0.51 / 0.24 |
+| roles, σ=3.5 | ~2–5 | 0.15 / 0.24 / 0.11 | **0.98** | 0.22 / 0.36 / 0.17 |
+| Pursuit, σ=2.5 | 11 (plus a leak at 2–3) | 0.30 / 0.79 / 0.20 | 0.85 | 0.24 / 0.76 / 0.19 |
+| Pursuit, σ=3.5 | 13 | 0.18 / 0.57 / 0.14 | 0.95 | 0.16 / 0.54 / 0.14 |
+
+In Pursuit the pooled numbers are dominated by the ~10-batch cold start. Once the
+reward model has learned the captures (iteration ~11 here), its grouping is
+near-oracle (per batch β 0.83–0.94, noise ≈ oracle). Over a 250-iteration run the cold
+start is ~4% of training.
+
+**What did not speed up the cold start:**
+- an auxiliary dynamics loss (predict o' from (o, a));
+- EMA weights;
+- replay of all past data;
+- reward-free clustering (§3.3).
+
+The reward model learns captures abruptly after ~9–11 iterations regardless.
+
+**Limitations / open points:**
+- **σ must be known** (sensor spec, or the paper's "known noise family"). Estimating σ
+  from data is only safe when some agents are persistently equal. Overestimating σ
+  leads to false certifications.
+- **ε is an erasure budget.** The RMS guarantee allows erasing very rare events
+  (p·Δ² ≤ ε²); this caused the early two-batch leak in Pursuit at σ=2.5. A relative
+  tolerance (ε² as a fraction of the noise-corrected within-step reward variance) would
+  protect rare events, but certifies far more slowly in SimpleSpread.
+- **Certification needs ~32·(σ/ε)⁴ merged-pair contrasts**, which is why it is slow at
+  σ=3.5. z ≈ 1 (one-sided) was the best trade-off here; z = 0 leaked, z = 2 rarely
+  certified within 20 batches.
+
+**Suggested paper framing.** "Certified consensus": noise-independent proposals (a
+reward model fitted on noisy rewards, identity structure from noise-free cross-agent
+moments) plus a certification test that bounds the RMS bias by ε w.h.p. It is
+task-agnostic, comes with a guarantee, and reduces to no correction when nothing can be
+certified. The oracle and warm-up variants become special cases with perfect proposals.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)
