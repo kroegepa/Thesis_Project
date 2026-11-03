@@ -22,6 +22,11 @@ Methods
                            merges most is used, otherwise no correction. Identity clusters only RESTRICT
                            merges (they cannot see rare situational events).
 
+Certified-method extensions: --shrink (certified shrinkage r^ = (1-l) r~ + l * consensus with
+l = min(1, eps/sqrt(UCB)), RMS bias <= eps before full certification), --granular (nested eps-gap
+rules at 0.5/1/2/4 eps, fixed-sequence test), --prioritize k (oversample large residuals when training
+the proposal model). Temporal (spatio-temporal) consensus potential: temporal_consensus_potential.py.
+
 Options: --teams k stacks k independent environments per row (k persistent teams), --team_offset shifts
 team j's rewards by j*offset (role-dependent reward level), --z confidence level, --decay memory.
 
@@ -310,8 +315,9 @@ class Net(nn.Module):
 
 
 class RewardModel:
-    def __init__(self, obs_shape, act_dim, cnn, aux=False, ema=0.0, lr=1e-3, bs=512, aux_w=1.0):
+    def __init__(self, obs_shape, act_dim, cnn, aux=False, ema=0.0, lr=1e-3, bs=512, aux_w=1.0, prioritize=0.0):
         torch.manual_seed(0)
+        self.prioritize = prioritize
         self.net = Net(obs_shape, act_dim, cnn, aux)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
         self.ema = ema
@@ -339,7 +345,14 @@ class RewardModel:
             self.skill_z = (dd.mean() / (dd.std() / dd.numel() ** 0.5)).item()
         o, a, o2 = d.obs.flatten(0, 2), d.action.flatten(0, 2), d.next_obs.flatten(0, 2)
         y = d.reward.flatten()
-        perm = torch.randperm(y.numel())
+        if self.prioritize and self.n_updates:
+            # proposal model only: oversample large residuals (rare events) - biased, but
+            # certification protects against bad proposals
+            r2 = (y - f.flatten()) ** 2
+            w = 1.0 + self.prioritize * r2 / r2.mean()
+            perm = torch.multinomial(w, y.numel(), replacement=True)
+        else:
+            perm = torch.randperm(y.numel())
         for s in range(0, y.numel(), self.bs):
             idx = perm[s:s + self.bs]
             r, dyn = self.net(o[idx], a[idx], o2[idx])
@@ -385,6 +398,9 @@ def main():
     p.add_argument("--sigma_mode", default="known", choices=["known", "est"])
     p.add_argument("--sigma_est", default="rice", choices=["rice", "mad"])
     p.add_argument("--skill_gate", type=int, default=1)
+    p.add_argument("--shrink", action="store_true")
+    p.add_argument("--granular", action="store_true")
+    p.add_argument("--prioritize", type=float, default=0.0)
     args = p.parse_args()
 
     n_act = 5
@@ -409,11 +425,13 @@ def main():
         rm = None
         certifier = BinCertifier(args.eps, args.sigma)
         rule = RuleCertifier(args.eps, z=args.z, decay=args.decay)
-        rules = {k: RuleCertifier(args.eps, z=args.z, decay=args.decay) for k in ["pred", "pred_in_id"]}
+        rules = {}
+        mults = [0.5, 1.0, 2.0, 4.0] if args.granular else [1.0]
+        shrink_lam = []
         diag = []
         grouped_frac = []
         if method.startswith(("rm", "combo", "certified")):
-            kw = dict(aux="aux" in method, ema=0.99 if "ema" in method else 0.0)
+            kw = dict(aux="aux" in method, ema=0.99 if "ema" in method else 0.0, prioritize=args.prioritize)
             rm = RewardModel(stream[0].obs.shape[3:], stream[0].action.shape[-1], cnn, **kw)
         for i, d in enumerate(stream):
             torch.manual_seed(i)
@@ -434,38 +452,54 @@ def main():
             elif method.startswith("cov"):
                 a = cov.assign(shape)
             elif method == "certified":
-                # candidate rules: identity clusters (cov, self-certified), prediction rule, prediction rule
-                # within identity clusters; use the certified rule that merges the most agents
-                # identity clusters only *restrict* merges: they cannot see situational events, and rare
-                # large events are invisible in reward moments, so merges must be vetted by the model
-                cands = []
+                # candidate rules: prediction rule(s), optionally within identity clusters; identity
+                # clusters only RESTRICT merges. Granular: nested eps-gap rules tested finest -> coarsest
+                # (fixed-sequence, no multiplicity penalty). Shrink: r^ = (1-l) r~ + l * consensus with
+                # l = min(1, eps / sqrt(UCB)), which keeps the RMS bias <= eps before full certification.
                 id_lab = cov.assign(shape).labels
+                a = Assignment()
+                chosen = "-"
                 if rm.n_updates:
                     pred = rm.predict(d)
-                    props = {"pred": epsilon_labels(pred, args.eps)}
-                    if id_lab is not None:
-                        sub = torch.full_like(id_lab, -1)
-                        for g in id_lab.unique().tolist():
-                            m = id_lab == g
-                            sub = torch.where(m, epsilon_labels(pred, args.eps, m) + g * n_agents, sub)
-                        props["pred_in_id"] = sub
                     s2 = sig.sig2 if est else true_sig2
                     skilled = (not est) or (not args.skill_gate) or (rm.skill_z is not None and rm.skill_z >= 3)
-                    for name, lab in props.items():
-                        if rules[name].ok and skilled:
-                            cands.append((name, lab))
-                        rules[name].update(lab, d.reward, s2)
-                    sig.update(d.reward - pred)  # residual-based per-agent noise variances
-                def size(lab):
-                    l = lab.reshape(-1, n_agents)
-                    return (l.unsqueeze(-1) == l.unsqueeze(-2)).float().sum(-1).mean().item()
-                if cands:
-                    name, lab = max(cands, key=lambda c: size(c[1]))
-                    a = Assignment(labels=lab)
-                    grouped_frac.append(name)
-                else:
-                    a = Assignment()
-                    grouped_frac.append("-")
+                    best = None  # (score, name, labels, lam)
+                    for variant in (["pred", "pred_in_id"] if id_lab is not None else ["pred"]):
+                        seq_ok = True
+                        for mult in mults:
+                            name = f"{variant}@{mult}"
+                            lab = epsilon_labels(pred, args.eps * mult)
+                            if variant == "pred_in_id":
+                                sub = torch.full_like(id_lab, -1)
+                                for g in id_lab.unique().tolist():
+                                    m = id_lab == g
+                                    sub = torch.where(m, epsilon_labels(pred, args.eps * mult, m) + g * n_agents, sub)
+                                lab = sub
+                            cert = rules.setdefault(name, RuleCertifier(args.eps, z=args.z, decay=args.decay))
+                            if skilled and cert.N >= 10:
+                                delta, margin = cert.stats()
+                                ucb = delta + margin
+                                lam = 1.0 if ucb <= args.eps ** 2 else (args.eps / np.sqrt(ucb) if args.shrink else 0.0)
+                                if args.granular and ucb > args.eps ** 2:
+                                    seq_ok = False  # fixed-sequence: stop at the first uncertified level
+                                l2 = lab.reshape(-1, n_agents)
+                                k = (l2.unsqueeze(-1) == l2.unsqueeze(-2)).float().sum(-1).mean().item()
+                                score = lam * (1 - 1 / k)  # fraction of noise variance removed (approx.)
+                                if lam > 0 and (best is None or score > best[0]):
+                                    best = (score, name, lab, lam)
+                            cert.update(lab, d.reward, s2)
+                            if not seq_ok:
+                                break
+                    if best is not None:
+                        _, chosen, lab, lam = best
+                        a = Assignment(labels=lab)
+                        shrink_lam.append(round(lam, 2))
+                    sig.update(d.reward - pred)
+                grouped_frac.append(chosen)
+                if a.labels is not None and shrink_lam and shrink_lam[-1] < 1.0:
+                    lam = shrink_lam[-1]
+                    full = apply_consensus(d.reward, a, d.mask)
+                    a = Assignment(replace=(1 - lam) * d.reward + lam * full)
             elif method.startswith("rm") and method.endswith("rule"):
                 if rm.n_updates:
                     pred = rm.predict(d)
@@ -533,6 +567,8 @@ def main():
             print(f"           sigma_i^2 estimate at end: bias={err.mean():+.3f} max|err|={np.abs(err).max():.3f}", flush=True)
         if diag:
             print(f"           (iter, true delta of proposal, est. delta (decayed), z*SE): {diag}", flush=True)
+        if shrink_lam:
+            print(f"           shrinkage lambda per grouped batch: {shrink_lam}", flush=True)
         if grouped_frac:
             print(f"           certified rule per batch: {[g if isinstance(g, str) else round(g, 2) for g in grouped_frac]}", flush=True)
         if method.startswith("cov"):

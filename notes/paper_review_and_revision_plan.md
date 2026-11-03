@@ -403,6 +403,57 @@ explain is temporally persistent". Present the σ-free variant (per-agent tempor
 estimation + identity from lag-1 statistics) as the fallback, together with the
 transient-event limitation as an identifiability result.
 
+#### 3.4.2 Further methods tried on top of certified consensus
+
+Certified consensus is now implemented (`grouping_method=certified`). It decouples
+**safety** (certification) from **performance** (proposal quality, and how quickly
+proposals can be certified). Proposals can therefore be generated or trained any way we
+like: bad ones simply fail certification.
+
+All runs: offline replay, known σ, z = 1.
+
+| idea | SimpleSpread σ=3.5 (common SNR) | Pursuit σ=3.5 (common / within SNR, β) | verdict |
+|---|---|---|---|
+| base certified | 0.24 | 0.18 / 0.16, β 0.95 | reference |
+| **certified shrinkage**: r̂ = (1−λ)r̃ + λ·consensus, λ = min(1, ε/√UCB) (RMS bias ≤ ε still holds) | **0.27** | **0.33 / 0.22**, β 0.70 | trade-off: earlier, partial noise reduction that spends the ε erasure budget during the cold start |
+| nested multi-granularity (ε-gap at 0.5–4ε, fixed-sequence test) | 0.19 | 0.18 / 0.16, β 0.95 | no gain: the finest level has the least evidence and blocks the rest |
+| prioritised proposal training (oversample large residuals) | – | 0.14 / 0.14 (never certified) | harmful: it oversamples *noise*, the model miscalibrates, proposals fail |
+
+**Spatio-temporal consensus** (`temporal_consensus_potential.py`): also average each
+agent's consensus reward over a centred window of w steps (pairs (i,t), (j,t′)).
+
+| | w=1 | w=3 | w=5 | w=9 |
+|---|---|---|---|---|
+| SimpleSpread σ=2.5, oracle groups: common SNR / β | 0.34 / 0.88 | 0.57 / 0.64 | **0.72** / 0.49 | 0.89 / 0.28 |
+| Pursuit σ=3.5, oracle groups: common SNR / β | 0.67 / 0.99 | 0.32 / 0.34 | 0.24 / 0.21 | 0.18 / 0.12 |
+
+- For persistent rewards (navigation and coverage terms, common in MARL), this
+  **doubles** the shared-objective SNR. The cost is smeared single-step credit
+  (collisions) and a small shift in reward timing.
+- For spiky rewards it is destructive, so temporal merges must be certified with the
+  same statistic.
+- Caveat: this needs **known σ**. A temporally estimated σ already absorbs temporal
+  changes, so it would certify every temporal merge.
+
+**Further ideas, not yet tested** (roughly in order of promise):
+1. **Reward model as a pseudo-agent.** Add f(τᵢ) to the consensus with a certified
+   weight, bounding E[(f − r)²] ≤ ε²/μ² from E[(r̃ − f)²] − σ². Once the model is
+   good, this also denoises agents with no group partner (e.g. small capture groups).
+2. **Critic-implied rewards as free proposals.** V(s_t) − γV(s_{t+1}) from the
+   MAPPO critic requires no extra model, and certification decides whether to trust it.
+3. **Small clean budget + certification.** Two clean batches already gave ~70% of the
+   oracle SNR (§3.3). Certification makes that practical system safe.
+4. **Anytime-valid certification** (confidence sequences / e-values). Certification is
+   re-tested every iteration with adaptively chosen rules, so the paper's guarantee
+   should use time-uniform bounds instead of the current decayed UCB.
+5. **Relative tolerance.** Certify that ≥ (1−κ) of the within-step reward variance is
+   kept, instead of an absolute ε. This protects rare events (no erasure budget) but
+   certifies more slowly.
+6. **Domain heuristics as proposals.** Task-specific rules (e.g. proximity to the same
+   target) can be plugged in safely, since they are certified like any other proposal.
+7. **Factor-model identity structure.** Continuous loadings for partially shared
+   rewards (e.g. per-agent local_ratio), generalising hard identity clusters.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)
