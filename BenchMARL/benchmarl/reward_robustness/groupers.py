@@ -79,6 +79,10 @@ class GroupingConfig:
     certify_decay: float = 0.5
     certify_noise_std: Optional[float] = None
     certify_skill_gate: bool = True
+    certify_temporal_window: int = 0
+    certify_ivw: bool = False
+    certify_warmup: bool = False
+    consensus: str = "mean"
 
 
 @dataclass
@@ -488,9 +492,22 @@ class CertifiedGrouper(RewardModelGrouper):
     noise-free skill test of the reward model (``reward_model_min_skill_z``) must also pass
     (``certify_skill_gate``), because unexplained single-step reward events inflate the
     variance estimate (see :mod:`benchmarl.reward_robustness.certification`).
+
+    Options:
+
+    * ``certify_ivw``: inverse-variance weighted group means (weights 1/s_j^2), the best
+      linear unbiased group estimate when noise levels differ between agents. Weights use the
+      per-agent variance estimates from earlier batches (also with a known common noise std).
+    * ``certify_temporal_window`` (odd w >= 3, known noise only): additionally average each
+      agent's corrected reward over its own +-w//2 neighbouring steps in the same episode
+      whose predicted rewards are epsilon-close. The temporal rule is certified the same
+      way, from ``(r~_{i,t+k} - r~_{i,t})^2 - 2 s_i^2`` over merged pairs.
+    * ``certify_warmup``: fit the proposal model on clean rewards during the experiment's
+      warm-up phase (``warmup_iters``, a few iterations suffice).
     """
 
     RULES = ("pred", "pred_in_id")
+    WARMUP_EPOCHS = 10
 
     def __init__(self, cfg: GroupingConfig, spec: TaskSpec, device="cpu"):
         super().__init__(cfg, spec, device)
@@ -503,9 +520,37 @@ class CertifiedGrouper(RewardModelGrouper):
         self.rules = {
             r: RuleCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay) for r in self.RULES
         }
+        from benchmarl.reward_robustness.certification import TemporalCertifier
+
         self.identity = IdentityStructure(cfg.epsilon, z=cfg.certify_z)
         self.noise = NoiseVarianceEstimator()
+        self.temporal = TemporalCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay)
         self.active_rule = "-"
+        self.temporal_active = False
+        if cfg.certify_temporal_window >= 3 and cfg.certify_noise_std is None:
+            import warnings
+
+            warnings.warn(
+                "certify_temporal_window needs a known noise std (certify_noise_std): a noise "
+                "variance estimated from temporal differences would make the temporal test vacuous. "
+                "Temporal merging is disabled."
+            )
+
+    @property
+    def needs_warmup(self) -> bool:
+        return self.cfg.certify_warmup
+
+    def warmup_update(self, data: GroupData) -> Dict[str, float]:
+        """Fit the proposal model on clean rewards (warm-up phase)."""
+        loss = float("nan")
+        for _ in range(self.WARMUP_EPOCHS):
+            loss = self._fit(data, data.reward, self._loss, data.mask)
+        return {"grouper/warmup_loss": loss}
+
+    @property
+    def half_window(self) -> int:
+        w = self.cfg.certify_temporal_window
+        return w // 2 if (w >= 3 and self.known_noise) else 0
 
     @property
     def known_noise(self) -> bool:
@@ -547,7 +592,36 @@ class CertifiedGrouper(RewardModelGrouper):
             return Assignment()
         return self._select(self.proposals(self.predict_rewards(data), data.mask))[1]
 
+    def _corrected(
+        self, data: GroupData, labels: Optional[torch.Tensor], var: Optional[torch.Tensor], neighbours
+    ) -> Optional[torch.Tensor]:
+        """Corrected rewards when IVW or temporal merging is active (else None: plain labels)."""
+        from benchmarl.reward_robustness.certification import temporal_average
+        from benchmarl.reward_robustness.consensus import apply_consensus
+
+        # IVW weights only affect efficiency, not bias, as long as they do not depend on the current
+        # noise: use the per-agent estimates from earlier batches whenever available
+        if self.cfg.certify_ivw and self.noise.variance is not None:
+            var = self.noise.variance
+        use_ivw = self.cfg.certify_ivw and var is not None and labels is not None
+        use_temporal = neighbours is not None
+        if not (use_ivw or use_temporal):
+            return None
+        if labels is None:
+            values = data.reward.clone()
+        elif use_ivw:
+            same = (labels.unsqueeze(-1) == labels.unsqueeze(-2)) & (labels >= 0).unsqueeze(-1)
+            weights = same.to(data.reward.dtype) * (1.0 / var.to(data.reward.device)).clamp(max=1e6)
+            values = apply_consensus(data.reward, Assignment(weights=weights), data.mask, method="mean")
+        else:
+            values = apply_consensus(data.reward, Assignment(labels=labels), data.mask, method=self.cfg.consensus)
+        if use_temporal:
+            values = temporal_average(values, neighbours)
+        return values
+
     def __call__(self, data: GroupData) -> Tuple[Assignment, Dict[str, float]]:
+        from benchmarl.reward_robustness.certification import temporal_neighbours
+
         logs: Dict[str, float] = {}
         assignment, pred = Assignment(), None
         n_agents = data.reward.shape[-1]
@@ -556,9 +630,22 @@ class CertifiedGrouper(RewardModelGrouper):
             props = self.proposals(pred, data.mask)
             self.active_rule, assignment = self._select(props)
             var = self.noise_variance(n_agents)
+            neighbours = None
+            if self.half_window:
+                neighbours = temporal_neighbours(
+                    pred, data.mask, data.done, self.half_window, self.cfg.epsilon
+                )
+                self.temporal_active = self.temporal.certified
+            values = self._corrected(
+                data, assignment.labels, var, neighbours if self.temporal_active else None
+            )
+            if values is not None:
+                assignment = Assignment(labels=assignment.labels, replace=values)
             if var is not None:  # certify the rules on this batch, for later batches
                 for r, lab in props.items():
                     self.rules[r].update(lab, data.reward, var, data.mask)
+                if neighbours is not None:
+                    self.temporal.update(data.reward, var, neighbours)
             self.noise.update(data.reward - pred, data.mask, data.done)
         self.identity.update(
             data.reward,
@@ -575,6 +662,11 @@ class CertifiedGrouper(RewardModelGrouper):
             logs[f"grouper/{r}_margin"] = margin
         if self.noise.variance is not None:
             logs["grouper/noise_var_mean"] = self.noise.variance.mean().item()
+        if self.half_window:
+            delta, margin = self.temporal.stats()
+            logs["grouper/temporal_active"] = float(self.temporal_active)
+            logs["grouper/temporal_delta"] = delta
+            logs["grouper/temporal_margin"] = margin
         return assignment, logs
 
     def state_dict(self) -> Dict:
@@ -584,6 +676,7 @@ class CertifiedGrouper(RewardModelGrouper):
                 rules={r: c.state_dict() for r, c in self.rules.items()},
                 identity=self.identity.state_dict(),
                 noise=self.noise.state_dict(),
+                temporal=self.temporal.state_dict(),
             )
         return state
 
@@ -594,6 +687,8 @@ class CertifiedGrouper(RewardModelGrouper):
                 c.load_state_dict(state["rules"][r])
             self.identity.load_state_dict(state["identity"])
             self.noise.load_state_dict(state["noise"])
+            if "temporal" in state:
+                self.temporal.load_state_dict(state["temporal"])
 
 
 class RewardModelOnlyGrouper(RewardModelGrouper):

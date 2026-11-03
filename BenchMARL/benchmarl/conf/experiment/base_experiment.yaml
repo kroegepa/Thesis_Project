@@ -74,7 +74,7 @@ consensus_trim: 0.2
 num_groups: 3
 # Log grouping quality and reward-error diagnostics (uses the true rewards, for analysis only)
 evaluate_grouping: False
-# Number of warm-up iterations on clean rewards (only used by grouping_method=warmup)
+# Number of warm-up iterations on clean rewards (grouping_method=warmup, or certified with certify_warmup)
 warmup_iters: 50
 # Training of the grouping network, per iteration (per warm-up iteration for "warmup")
 grouping_epochs: 35
@@ -123,6 +123,15 @@ certify_noise_std: null
 # In noise-variance-free mode, also require the reward model to beat a constant out of sample
 # (reward_model_min_skill_z); guards against not-yet-learned single-step reward events
 certify_skill_gate: True
+# Inverse-variance weighted group means (weights 1/s_j^2): best unbiased group estimate when agents'
+# noise levels differ (uses the per-agent estimates in noise-variance-free mode)
+certify_ivw: False
+# Also average each agent's corrected reward over its own neighbouring steps (odd window, e.g. 5;
+# 0 = off), only where predicted rewards are epsilon-close and the temporal rule is certified.
+# Requires certify_noise_std (known noise). Large gains for persistent rewards (navigation/coverage)
+certify_temporal_window: 0
+# Fit the proposal reward model on clean rewards during a short warm-up (warmup_iters iterations, e.g. 2)
+certify_warmup: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8

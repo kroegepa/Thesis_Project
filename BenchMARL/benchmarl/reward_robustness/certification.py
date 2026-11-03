@@ -245,3 +245,109 @@ class NoiseVarianceEstimator:
 
     def load_state_dict(self, state: Dict) -> None:
         self.ss, self.cnt = state["ss"], state["cnt"]
+
+
+def _no_boundary(done: Optional[torch.Tensor], t_len: int, k: int, shape) -> torch.Tensor:
+    """``[B, T]`` bool: steps t and t+k lie in the same episode (no done in [t, t+k-1])."""
+    if done is None:
+        return torch.ones(shape[:2], dtype=torch.bool)
+    csum = torch.cat([torch.zeros_like(done[:, :1], dtype=torch.long), done.long().cumsum(1)], 1)  # [B, T+1]
+    ok = torch.zeros(shape[:2], dtype=torch.bool)
+    if k < t_len:
+        ok[:, : t_len - k] = (csum[:, k: t_len] - csum[:, : t_len - k]) == 0
+    return ok
+
+
+def temporal_neighbours(
+    pred: torch.Tensor,
+    mask: torch.Tensor,
+    done: Optional[torch.Tensor],
+    half_window: int,
+    epsilon: Optional[float],
+) -> Dict[int, torch.Tensor]:
+    """For each offset k in [-h, h] \\ {0}: ``[B, T, A]`` bool, (i, t+k) may be merged with (i, t).
+
+    Same agent, same episode, both alive and, if ``epsilon`` is given, the reward model's
+    predictions at t and t+k are epsilon-close (vetting).
+    """
+    b, t_len, a = pred.shape
+    out = {}
+    for k in range(1, half_window + 1):
+        if k >= t_len:
+            break
+        fwd = torch.zeros_like(mask)
+        same_ep = _no_boundary(done, t_len, k, pred.shape).unsqueeze(-1)
+        fwd[:, : t_len - k] = (mask[:, : t_len - k] & mask[:, k:] & same_ep[:, : t_len - k])
+        if epsilon is not None:
+            close = torch.zeros_like(mask)
+            close[:, : t_len - k] = (pred[:, k:] - pred[:, : t_len - k]).abs() <= epsilon
+            fwd &= close
+        bwd = torch.zeros_like(mask)
+        bwd[:, k:] = fwd[:, : t_len - k]  # (i, t) pairs with (i, t-k)
+        out[k], out[-k] = fwd, bwd
+    return out
+
+
+def temporal_average(values: torch.Tensor, neighbours: Dict[int, torch.Tensor]) -> torch.Tensor:
+    """Average each (i, t) with its allowed temporal neighbours (i, t+k)."""
+    num, den = values.clone(), torch.ones_like(values)
+    t_len = values.shape[1]
+    for k, ok in neighbours.items():
+        shifted = torch.zeros_like(values)
+        if k > 0:
+            shifted[:, : t_len - k] = values[:, k:]
+        else:
+            shifted[:, -k:] = values[:, : t_len + k]
+        num = num + torch.where(ok, shifted, torch.zeros_like(values))
+        den = den + ok.to(values.dtype)
+    return num / den
+
+
+class TemporalCertifier:
+    """Certify merging an agent's reward with its own neighbouring steps.
+
+    Per merged temporal pair: ``(r~_{i,t+k} - r~_{i,t})^2 - 2 s_i^2`` is unbiased for the squared
+    change of the true reward. Requires a *known* noise variance: a variance estimated from
+    temporal differences already absorbs temporal reward changes, which would make this
+    test vacuous.
+    """
+
+    def __init__(self, epsilon: float, z: float = 1.0, decay: float = 0.5, min_pairs: float = 100.0):
+        self.epsilon, self.z, self.decay, self.min_pairs = epsilon, z, decay, min_pairs
+        self.n = self.s = self.ss = 0.0
+
+    def update(self, reward: torch.Tensor, noise_var: torch.Tensor, neighbours: Dict[int, torch.Tensor]) -> None:
+        var = torch.as_tensor(noise_var, dtype=torch.float64).expand_as(reward)
+        x = reward.double()
+        t_len = x.shape[1]
+        self.n *= self.decay
+        self.s *= self.decay
+        self.ss *= self.decay
+        for k, ok in neighbours.items():
+            if k <= 0:
+                continue
+            diff = torch.zeros_like(x)
+            diff[:, : t_len - k] = x[:, k:] - x[:, : t_len - k]
+            stat = (diff ** 2 - 2 * var)[ok]
+            self.n += stat.numel()
+            self.s += stat.sum().item()
+            self.ss += (stat ** 2).sum().item()
+
+    def stats(self):
+        if self.n <= 0:
+            return float("nan"), float("nan")
+        mean = self.s / self.n
+        return mean, self.z * float(np.sqrt(max(self.ss / self.n - mean ** 2, 0.0) / self.n))
+
+    @property
+    def certified(self) -> bool:
+        if self.n < self.min_pairs:
+            return False
+        delta, margin = self.stats()
+        return delta + margin <= self.epsilon ** 2
+
+    def state_dict(self) -> Dict:
+        return {"n": self.n, "s": self.s, "ss": self.ss}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.n, self.s, self.ss = state["n"], state["s"], state["ss"]

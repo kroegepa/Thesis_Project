@@ -109,6 +109,9 @@ class ExperimentConfig:
     certify_decay: float = MISSING
     certify_noise_std: Optional[float] = MISSING
     certify_skill_gate: bool = MISSING
+    certify_temporal_window: int = MISSING
+    certify_ivw: bool = MISSING
+    certify_warmup: bool = MISSING
 
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING

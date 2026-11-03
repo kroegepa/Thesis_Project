@@ -86,6 +86,10 @@ class RewardRobustness:
             certify_decay=config.certify_decay,
             certify_noise_std=config.certify_noise_std,
             certify_skill_gate=config.certify_skill_gate,
+            certify_temporal_window=config.certify_temporal_window,
+            certify_ivw=config.certify_ivw,
+            certify_warmup=config.certify_warmup,
+            consensus=self.consensus,
             epsilon=config.grouping_epsilon,
         )
         self.grouper: Optional[Grouper] = (

@@ -32,6 +32,9 @@ from benchmarl.reward_robustness.certification import (
     IdentityStructure,
     NoiseVarianceEstimator,
     RuleCertifier,
+    temporal_average,
+    temporal_neighbours,
+    TemporalCertifier,
 )
 from benchmarl.reward_robustness.perturbation import perturb_rewards
 from benchmarl.reward_robustness.task_spec import get_task_spec
@@ -387,3 +390,67 @@ class TestCertifiedGrouper:
         assert (g2.identity.labels == g1.identity.labels).all()
         data = _fake_data_big(9)
         assert torch.allclose(g1.predict_rewards(data), g2.predict_rewards(data))
+
+
+class TestTemporal:
+    def test_neighbours_respect_episodes_mask_and_vetting(self):
+        pred = torch.zeros(1, 6, 2)
+        pred[0, 3, 1] = 5.0  # agent 1: predicted event at t=3
+        mask = torch.ones(1, 6, 2, dtype=torch.bool)
+        done = torch.zeros(1, 6, dtype=torch.bool)
+        done[0, 2] = True  # episode ends after t=2
+        nb = temporal_neighbours(pred, mask, done, 1, epsilon=0.5)
+        assert nb[1][0, 1, 0] and not nb[1][0, 2, 0]  # (1,2) same episode, (2,3) crosses the boundary
+        assert not nb[1][0, 3, 1] and not nb[-1][0, 4, 1]  # vetting blocks the event step
+        assert torch.equal(nb[-1][0, 1:], nb[1][0, :-1])  # backward = shifted forward
+
+    def test_temporal_average(self):
+        v = torch.tensor([[[1.0], [2.0], [3.0], [10.0]]])
+        nb = temporal_neighbours(torch.zeros_like(v), torch.ones_like(v, dtype=torch.bool), None, 1, None)
+        out = temporal_average(v, nb)
+        assert torch.allclose(out[0, :, 0], torch.tensor([1.5, 2.0, 5.0, 6.5]))
+
+    def test_temporal_certifier(self):
+        g = torch.Generator().manual_seed(0)
+        smooth = torch.linspace(0, 1, 400).repeat(4, 1).unsqueeze(-1).expand(4, 400, 3)
+        spiky = (torch.rand(4, 400, 3, generator=g) < 0.05).float() * 5.0
+        var = torch.ones(3)
+        for true, expect in [(smooth, True), (spiky, False)]:
+            noisy = true + torch.randn(true.shape, generator=g)
+            nb = temporal_neighbours(torch.zeros_like(true), torch.ones_like(true, dtype=torch.bool), None, 2, None)
+            cert = TemporalCertifier(0.5)
+            cert.update(noisy, var, nb)
+            assert cert.certified == expect
+
+
+class TestCertifiedExtensions:
+    spec = get_task_spec("pursuit")
+
+    def test_temporal_ivw_and_warmup(self):
+        torch.manual_seed(0)
+        cfg = GroupingConfig(
+            method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0,
+            certify_temporal_window=3, certify_ivw=True, certify_warmup=True,
+        )
+        grouper = make_grouper(cfg, self.spec)
+        assert grouper.needs_warmup and grouper.half_window == 1
+        clean = _fake_data_big(0)
+        clean.reward = clean.true_reward.clone()
+        logs = grouper.warmup_update(clean)
+        assert logs["grouper/warmup_loss"] < 1.0
+        replaced = 0
+        for seed in range(1, 5):
+            data = _fake_data_big(seed)
+            assignment, logs = grouper(data)
+            assert "grouper/temporal_delta" in logs
+            if assignment.replace is not None:
+                replaced += 1
+                corrected = apply_consensus(data.reward, assignment, data.mask)
+                err = ((corrected - data.true_reward) ** 2).mean()
+                assert err < ((data.reward - data.true_reward) ** 2).mean()
+        assert replaced >= 2  # warm-started model -> certified early
+
+    def test_temporal_needs_known_noise(self):
+        with pytest.warns(UserWarning):
+            g = make_grouper(GroupingConfig(method="certified", certify_temporal_window=5), self.spec)
+        assert g.half_window == 0

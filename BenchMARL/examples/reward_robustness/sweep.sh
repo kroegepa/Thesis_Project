@@ -59,6 +59,15 @@ python benchmarl/run.py -m $COMMON \
   experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
   'experiment.certify_noise_std=${experiment.reward_perturbation_stdev},null' "${@:2}"
 
+# 2c) Certified consensus with extensions (known noise std): temporal merging, IVW, and with/without
+#     a 2-iteration clean warm-up of the proposal model
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=certified \
+  experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
+  'experiment.certify_noise_std=${experiment.reward_perturbation_stdev}' \
+  experiment.certify_temporal_window=5 experiment.certify_ivw=True \
+  experiment.certify_warmup=False,True experiment.warmup_iters=2 "${@:2}"
+
 # 3) Robust global aggregation baseline (Byzantine-style global median, Reviewer 3)
 python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=global experiment.consensus=median "${@:2}"

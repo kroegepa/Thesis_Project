@@ -88,6 +88,24 @@ Noise variance:
     known-σ mode. In the offline tests it kept 0.77–0.85 of within-step credit in
     Pursuit vs 0.95 with known σ.
 
+Extensions:
+
+- `certify_ivw=True`: inverse-variance weighted group means (weights 1/sᵢ²), the best
+  linear unbiased estimate when agents' noise levels differ. Weights use per-agent
+  estimates from earlier batches, so the mean stays unbiased.
+- `certify_temporal_window=5` (known noise std only): also average each agent's corrected
+  reward over its own neighbouring steps (same episode) whose predicted rewards are
+  ε-close. The temporal rule is certified like the spatial one, from
+  (r̃_{i,t+k} − r̃_{i,t})² − 2sᵢ². This gives large gains for persistent rewards, and is
+  rejected automatically for spiky ones until the model explains the spikes.
+- `certify_warmup=True warmup_iters=2`: fit the proposal model on a few clean iterations
+  first. Certification then starts almost immediately.
+
+Offline results (Pursuit σ=3.5, within-step SNR pooled over a 20-iteration stream; no
+correction 0.14, spatial oracle 0.54): certified 0.16 → + 2 clean batches 0.43 →
++ 2 clean batches + temporal window 5 **0.74**. SimpleSpread σ=2.5 (shared-objective SNR;
+none 0.20, oracle 0.42): certified 0.38 → + temporal 0.52.
+
 Recommended: `grouping_use_next_obs=True grouping_epochs=1`. ε (`grouping_epsilon`) is the
 tolerance of Assumption 1 in reward units. It is also an "erasure budget": events with
 rate p and size Δ may be averaged away if p·Δ² ≤ ε².

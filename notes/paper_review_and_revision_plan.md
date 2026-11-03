@@ -454,6 +454,44 @@ agent's consensus reward over a centred window of w steps (pairs (i,t), (j,t′)
 7. **Factor-model identity structure.** Continuous loadings for partially shared
    rewards (e.g. per-agent local_ratio), generalising hard identity clusters.
 
+#### 3.4.3 Second round: certified extensions (now in the package)
+
+Offline, known σ, using the **package** `CertifiedGrouper` on the recorded streams.
+Metrics are pooled over the 20-iteration stream unless noted.
+
+| Pursuit σ=3.5 | common SNR | within SNR | β |
+|---|---|---|---|
+| no correction | 0.14 | 0.14 | 1.00 |
+| spatial oracle | 0.57 | 0.54 | 1.00 |
+| certified | 0.17 | 0.16 | 0.97 |
+| certified + temporal window 5 | 0.17 (0.36 after it. 13) | 0.16 (0.30) | 0.96 |
+| certified + 2 clean warm-up batches | 0.53 | 0.43 | 0.86 |
+| **certified + 2 clean batches + temporal window 5** | **0.86** | **0.74** | 0.86 (0.93 after it. 13) |
+
+| SimpleSpread | certified | + temporal window 5 |
+|---|---|---|
+| σ=2.5, common SNR (none 0.20, oracle 0.42) | 0.38 | **0.52** |
+| σ=3.5, common SNR (none 0.14, oracle 0.30) | 0.24 | **0.34** |
+| roles σ=2.5, common / within SNR | 0.24 / 0.36, β 0.98 | **0.38 / 0.57**, β 0.97 |
+| per-agent noise levels, σ=2.5, + IVW | 0.47 → 0.51 (IVW) | **0.68** (IVW + temporal) |
+
+**Takeaways**
+- **Certified temporal merging** is the largest new gain. It gives +37–52% SNR in
+  SimpleSpread and +56% in Pursuit once the model has learned, and is certified
+  automatically only where rewards persist (it was never certified unvetted in Pursuit).
+- **A tiny clean budget plus certification is the best practical system.** With 2 clean
+  iterations (6k frames, ~4% of the paper's warm-up), certification starts at
+  iteration 1. With temporal merging, Pursuit's within-step SNR reaches 0.74 vs the
+  spatial oracle's 0.54.
+- **Model-as-pseudo-agent** and **shrinkage** reduce noise but spend the ε budget on
+  systematic bias. In SimpleSpread, ε=0.5 is larger than the whole shared signal
+  (std 0.40), so the pseudo-agent erased it. **ε must be set relative to the reward
+  signal scale.**
+- **Prioritised proposal training** and **nested granularity** did not help (§3.4.2).
+- In the exploration harness, a clean warm start appeared useless. That was an
+  architecture artefact: encoding o and o′ separately learns events much worse than
+  stacking them as channels, which the package does.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)
