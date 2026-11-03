@@ -352,6 +352,57 @@ moments) plus a certification test that bounds the RMS bias by ε w.h.p. It is
 task-agnostic, comes with a guarantee, and reduces to no correction when nothing can be
 certified. The oracle and warm-up variants become special cases with perfect proposals.
 
+#### 3.4.1 Can the known-σ assumption be dropped?
+
+**What is actually assumed.** The certification identity
+E[(r̃ᵢ − r̃ⱼ)²] = E[(rᵢ − rⱼ)²] + σᵢ² + σⱼ²
+only needs additive noise that is zero-mean and independent across agents and steps.
+It does **not** need symmetric or Gaussian noise, and it does not need equal σ across
+agents. The Gaussian SE formula has been replaced by an empirical SE.
+
+**Fundamental limit.** Each agent yields one noisy value per step, so within a step the
+noise variance and true reward differences are confounded. Some form of replication
+is needed:
+- **Persistent structure (roles, offsets) is σ-free.** Lag-1 cross-products of
+  pairwise difference series, E[D_t D_{t−1}], contain no noise term.
+- **Per-agent σᵢ can be estimated from temporal differences.** Noise is fresh each
+  step while rewards often persist. Using the reward-model residuals r̃ − f, the
+  estimate is shape-free and handles heteroscedastic noise.
+- **One-step (transient) reward differences that the model has not explained are
+  temporally white.** In second-order statistics they are indistinguishable from
+  noise, so without known σ they cannot be bounded (they inflate σ̂ by exactly their
+  variance). Certifying tolerance ε needs σ² to within ~ε²/2, i.e. ~1% of σ² at σ=3.5,
+  ε=0.5.
+
+**Results** (SNR on the shared objective, with β where relevant; z = 1):
+
+| setting | σ known | σ estimated (shape-free) | σ estimated + skill gate |
+|---|---|---|---|
+| SimpleSpread, σ=2.5 | 0.38 | 0.30 | 0.23 |
+| roles, σ=2.5 | 0.25, β 0.98 | 0.24, β 0.98 | 0.18, β 0.99 |
+| per-agent noise levels, σ=2.5 | 0.47 | 0.38 | 0.31 |
+| skewed noise, σ=2.5 | 0.28 | 0.23 | 0.20 |
+| Pursuit, σ=3.5 | 0.18, **β 0.95** | 0.24, β 0.77 | 0.21, β 0.85 |
+
+References: SimpleSpread no correction 0.20, oracle 0.42. Pursuit: ungated reward
+model β 0.61, global grouping β 0.
+
+- **Temporally persistent rewards (SimpleSpread):** σ-free certification keeps ~75–95%
+  of the known-σ benefit and is robust to heteroscedastic and skewed noise. A
+  Gaussian-shape (MAD) estimator *fails safe* under skewed noise (underestimates σ²,
+  never certifies).
+- **Transient events (Pursuit):** σ̂ is inflated by ~0.2 by not-yet-explained capture
+  spikes. Certification then switches on 2–5 batches early and leaks some credit
+  (β 0.77–0.85 vs 0.95 with known σ). That is still far safer than uncertified grouping.
+  A stricter σ-free skill threshold (z ≈ 10) would roughly match the known-σ timing
+  here, but it is a heuristic.
+
+**Recommendation for the paper.** State the assumption as "noise variance known to
+within ε²/2 (e.g. sensor specification), *or* reward variation that the model does not
+explain is temporally persistent". Present the σ-free variant (per-agent temporal
+estimation + identity from lag-1 statistics) as the fallback, together with the
+transient-event limitation as an identifiability result.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)

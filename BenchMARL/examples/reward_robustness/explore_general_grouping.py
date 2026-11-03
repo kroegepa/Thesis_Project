@@ -1,6 +1,11 @@
 """Research harness (offline): general, task-agnostic ways to find reward-equivalence groups under noise.
 
-Run on streams recorded with collect_stream.py (pursuit16, spread5, ...). Gaussian noise with KNOWN sigma.
+Run on streams recorded with collect_stream.py (pursuit16, spread5, ...). Additive zero-mean noise, independent
+across agents and steps: --noise gauss|laplace|skew, --hetero (per-agent std in [0.5, 1.5]*sigma).
+--sigma_mode known: certification uses the true per-agent noise variances.
+--sigma_mode est: sigma-free. Identity structure from lag-1 cross-products of pairwise difference series
+(noise-free); per-agent noise variances from temporal differences of reward-model residuals
+(--sigma_est rice: shape-free, mad: assumes Gaussian shape); optional sigma-free skill gate (--skill_gate).
 
 Methods
   none / global / oracle   references (oracle = epsilon-oracle on true rewards, --oracle_eps)
@@ -85,8 +90,9 @@ class CovGrouper:
     Statistics come from previous batches only (out of sample).
     """
 
-    def __init__(self, n_agents, eps, sigma=None, z=2.0):
-        self.a, self.eps, self.sigma, self.z = n_agents, eps, sigma, z
+    def __init__(self, n_agents, eps, sigma=None, z=2.0, lag=False):
+        self.a, self.eps, self.sigma, self.z, self.lag = n_agents, eps, sigma, z, lag
+        self.lag_s = np.zeros((n_agents, n_agents)); self.lag_ss = np.zeros((n_agents, n_agents)); self.lag_n = 0
         self.n = 0
         self.s1 = np.zeros(n_agents)
         self.s2 = np.zeros((n_agents, n_agents))
@@ -97,22 +103,35 @@ class CovGrouper:
         self.n += x.shape[0]
         self.s1 += x.sum(0)
         self.s2 += x.T @ x
+        if self.lag:
+            # lag-1 cross-products of pairwise difference series: E[D_t D_{t-1}] has NO noise term
+            # (noise independent over time) -> sigma-free estimate of persistent squared differences
+            r = reward.double().numpy()                      # [B, T, A]
+            D = r[..., :, None] - r[..., None, :]            # [B, T, A, A]
+            prod = (D[:, 1:] * D[:, :-1]).reshape(-1, self.a, self.a)
+            self.lag_s += prod.sum(0); self.lag_ss += (prod ** 2).sum(0); self.lag_n += prod.shape[0]
         self._recluster()
 
     def sigma2(self, D):
         if self.sigma is not None:
-            return self.sigma ** 2
+            sg = np.asarray(self.sigma, dtype=float)
+            return float((sg ** 2).mean()) if sg.ndim else float(sg ** 2)
         # estimate: smallest pairwise difference variance / 2 (valid if some pair is equal)
         off = D[~np.eye(self.a, dtype=bool)]
         return float(np.sort(off)[: max(1, len(off) // 10)].mean() / 2)
 
     def _recluster(self):
-        M = self.s2 / self.n  # uncentred second moments: mean offsets between agents count too
-        diag = np.diag(M)
-        D = diag[:, None] + diag[None, :] - 2 * M  # E[(r~_i - r~_j)^2] = E[(r_i - r_j)^2] + 2 sigma^2
-        s2 = self.sigma2(D)
-        delta = D - 2 * s2
-        se_pair = 2 * s2 * np.sqrt(2.0 / self.n)  # SE of one pairwise difference variance
+        if self.lag:
+            delta = self.lag_s / self.lag_n
+            se_pair = np.sqrt(np.clip(self.lag_ss / self.lag_n - delta ** 2, 0, None) / self.lag_n)
+            se_pair = se_pair[~np.eye(self.a, dtype=bool)].mean()
+        else:
+            M = self.s2 / self.n  # uncentred second moments: mean offsets between agents count too
+            diag = np.diag(M)
+            D = diag[:, None] + diag[None, :] - 2 * M  # E[(r~_i - r~_j)^2] = E[(r_i - r_j)^2] + 2 sigma^2
+            s2 = self.sigma2(D)
+            delta = D - 2 * s2
+            se_pair = 2 * s2 * np.sqrt(2.0 / self.n)  # SE of one pairwise difference variance
         # Top-down certification along an average-linkage dendrogram of the point estimates:
         # accept a node if every member's mean delta to the other members has UCB <= eps^2
         # (pooling over k-1 pairs shrinks the SE by ~sqrt(k-1)); otherwise recurse.
@@ -192,45 +211,73 @@ class BinCertifier:
 
 
 class RuleCertifier:
-    """Certify a grouping *rule* from the pairs it merges (pooled over all merged pairs).
+    """Certify a grouping *rule* from the same-step pairs it merges (pooled over all merged pairs).
 
-    delta = mean over merged same-step pairs of (r~_i - r~_j)^2 - 2 sigma^2 is an unbiased estimate
-    of the mean squared reward difference of merged pairs; certification (UCB <= eps^2) bounds the
-    RMS bias of the consensus by eps. Stats come from the previous batches' proposals (lagged,
-    out of sample for the model that made them) with exponential decay.
+    Per merged pair: (r~_i - r~_j)^2 - s_i^2 - s_j^2 has expectation (r_i - r_j)^2 for independent zero-mean
+    noise with variances s_i^2 (any shape). Units = (step, group); the SE is estimated empirically from the
+    spread of unit statistics (no Gaussian formula). Lagged, out of sample, exponentially decayed.
     """
 
-    def __init__(self, eps, sigma, z=2.0, decay=0.5):
-        self.eps, self.sigma, self.z, self.decay = eps, sigma, z, decay
-        self.ss = self.npairs = self.dof = 0.0
+    def __init__(self, eps, z=1.0, decay=0.5):
+        self.eps, self.z, self.decay = eps, z, decay
+        self.W = self.S1 = self.S2 = self.N = 0.0
 
     def stats(self):
-        s2 = self.sigma ** 2
-        delta = self.ss / self.npairs - 2 * s2
-        return delta, self.z * 2 * s2 * np.sqrt(2.0 / self.dof)
+        mean = self.S1 / self.W
+        var = max(self.S2 / self.W - mean ** 2, 0.0)
+        return mean, self.z * np.sqrt(var / max(self.N, 1.0))
 
     @property
     def ok(self):
-        if self.dof < 2:
+        if self.N < 10:
             return False
         delta, margin = self.stats()
         return delta + margin <= self.eps ** 2
 
-    def update(self, labels, reward):
+    def update(self, labels, reward, sig2):
         a = labels.shape[-1]
         lab = labels.reshape(-1, a)
         x = reward.reshape(-1, a).double()
-        self.ss *= self.decay; self.npairs *= self.decay; self.dof *= self.decay
+        s2 = torch.as_tensor(sig2, dtype=torch.float64).expand_as(x)
+        self.W *= self.decay; self.S1 *= self.decay; self.S2 *= self.decay; self.N *= self.decay
         for k in lab.unique().tolist():
             if k < 0:
                 continue
             m = (lab == k).double()
             n = m.sum(1)
-            sx, sxx = (x * m).sum(1), (x * x * m).sum(1)
             rows = n >= 2
-            self.ss += (n * sxx - sx ** 2)[rows].sum().item()
-            self.npairs += (n * (n - 1) / 2)[rows].sum().item()
-            self.dof += (n - 1)[rows].sum().item()
+            if not rows.any():
+                continue
+            sx, sxx = (x * m).sum(1), (x * x * m).sum(1)
+            pairs = n * (n - 1) / 2
+            stat = ((n * sxx - sx ** 2) - (n - 1) * (s2 * m).sum(1))[rows] / pairs[rows]  # mean over pairs
+            w = pairs[rows]
+            self.W += w.sum().item(); self.S1 += (w * stat).sum().item()
+            self.S2 += (w * stat ** 2).sum().item(); self.N += float(rows.sum())
+
+
+class SigmaEstimator:
+    """Per-agent noise variance from temporal differences of residuals e = r~ - f (f = out-of-sample reward
+    model). mode="rice": mean(de^2)/2 (shape-free; biased up by reward changes f does not explain).
+    mode="mad": (MAD(de)/0.6745)^2/2 (needs the noise SHAPE, here Gaussian; robust to sparse jumps)."""
+
+    def __init__(self, n_agents, mode="rice", decay=0.7, keep=3):
+        self.mode, self.decay, self.keep = mode, decay, keep
+        self.ss, self.n, self.buf = np.zeros(n_agents), 0.0, []
+
+    def update(self, resid):  # [B, T, A], consecutive steps along T
+        d = (resid[:, 1:] - resid[:, :-1]).reshape(-1, resid.shape[-1]).double().numpy()
+        self.ss = self.ss * self.decay + (d ** 2).sum(0) / 2
+        self.n = self.n * self.decay + d.shape[0]
+        self.buf = (self.buf + [d])[-self.keep:]
+
+    @property
+    def sig2(self):
+        if self.mode == "mad" and self.buf:
+            d = np.concatenate(self.buf)
+            mad = np.median(np.abs(d - np.median(d, 0)), 0)
+            return (mad / 0.6745) ** 2 / 2
+        return self.ss / max(self.n, 1.0)
 
 
 # ----------------------------------------------------------------------------- reward models
@@ -332,7 +379,12 @@ def main():
     p.add_argument("--methods", nargs="+", default=["none", "oracle", "global", "cov", "cov_est"])
     p.add_argument("--oracle_eps", type=float, default=0.05)
     p.add_argument("--decay", type=float, default=0.5)
-    p.add_argument("--z", type=float, default=2.0)
+    p.add_argument("--z", type=float, default=1.0)
+    p.add_argument("--noise", default="gauss", choices=["gauss", "laplace", "skew"])
+    p.add_argument("--hetero", action="store_true", help="per-agent noise std in [0.5, 1.5] * sigma")
+    p.add_argument("--sigma_mode", default="known", choices=["known", "est"])
+    p.add_argument("--sigma_est", default="rice", choices=["rice", "mad"])
+    p.add_argument("--skill_gate", type=int, default=1)
     args = p.parse_args()
 
     n_act = 5
@@ -341,6 +393,9 @@ def main():
         stream = [composite(d, args.teams, args.team_offset) for d in stream]
     shape = stream[0].reward.shape
     n_agents = shape[-1]
+    scales = np.random.default_rng(123).uniform(0.5, 1.5, n_agents) if args.hetero else np.ones(n_agents)
+    agent_scale = torch.as_tensor(args.sigma * scales, dtype=torch.float32)
+    true_sig2 = (args.sigma * scales) ** 2
     cnn = len(stream[0].obs.shape) == 6
     print(f"task={args.task} sigma={args.sigma} eps={args.eps} teams={args.teams} agents={n_agents} "
           f"batches={len(stream)}", flush=True)
@@ -348,11 +403,13 @@ def main():
     for method in args.methods:
         t0 = time.time()
         acc, gated_acc, traj = Acc(), Acc(), []
-        cov = CovGrouper(n_agents, args.eps, sigma=None if method.endswith("_est") else args.sigma, z=args.z)
+        est = args.sigma_mode == "est"
+        cov = CovGrouper(n_agents, args.eps, sigma=None if est else args.sigma * scales, z=args.z, lag=est)
+        sig = SigmaEstimator(n_agents, mode=args.sigma_est)
         rm = None
         certifier = BinCertifier(args.eps, args.sigma)
-        rule = RuleCertifier(args.eps, args.sigma, z=args.z, decay=args.decay)
-        rules = {k: RuleCertifier(args.eps, args.sigma, z=args.z, decay=args.decay) for k in ["pred", "pred_in_id"]}
+        rule = RuleCertifier(args.eps, z=args.z, decay=args.decay)
+        rules = {k: RuleCertifier(args.eps, z=args.z, decay=args.decay) for k in ["pred", "pred_in_id"]}
         diag = []
         grouped_frac = []
         if method.startswith(("rm", "combo", "certified")):
@@ -360,7 +417,13 @@ def main():
             rm = RewardModel(stream[0].obs.shape[3:], stream[0].action.shape[-1], cnn, **kw)
         for i, d in enumerate(stream):
             torch.manual_seed(i)
-            d.reward = perturb_rewards(d.true_reward, "normal", stdev=args.sigma)
+            if args.noise == "gauss":
+                z = torch.randn_like(d.true_reward)
+            elif args.noise == "laplace":
+                z = torch.distributions.Laplace(0.0, 1.0 / np.sqrt(2)).sample(d.true_reward.shape)
+            else:  # skew: centred exponential, zero mean, unit variance
+                z = torch.empty_like(d.true_reward).exponential_() - 1.0
+            d.reward = d.true_reward + z * agent_scale
             gated = None
             if method == "none":
                 a = Assignment()
@@ -386,10 +449,13 @@ def main():
                             m = id_lab == g
                             sub = torch.where(m, epsilon_labels(pred, args.eps, m) + g * n_agents, sub)
                         props["pred_in_id"] = sub
+                    s2 = sig.sig2 if est else true_sig2
+                    skilled = (not est) or (not args.skill_gate) or (rm.skill_z is not None and rm.skill_z >= 3)
                     for name, lab in props.items():
-                        if rules[name].ok:
+                        if rules[name].ok and skilled:
                             cands.append((name, lab))
-                        rules[name].update(lab, d.reward)
+                        rules[name].update(lab, d.reward, s2)
+                    sig.update(d.reward - pred)  # residual-based per-agent noise variances
                 def size(lab):
                     l = lab.reshape(-1, n_agents)
                     return (l.unsqueeze(-1) == l.unsqueeze(-2)).float().sum(-1).mean().item()
@@ -406,11 +472,7 @@ def main():
                     proposal = epsilon_labels(pred, args.eps)       # merge agents with close predictions
                     a = Assignment(labels=proposal) if rule.ok else Assignment()
                     grouped_frac.append(float(rule.ok))
-                    rule.update(proposal, d.reward)                 # certify the rule for later batches
-                    truth = RuleCertifier(args.eps, 1e-9, decay=0.0)
-                    truth.update(proposal, d.true_reward)
-                    est, margin = rule.stats()
-                    diag.append((i, round(truth.ss / max(truth.npairs, 1), 3), round(est, 3), round(margin, 3)))
+                    rule.update(proposal, d.reward, true_sig2)      # certify the rule for later batches
                 else:
                     a = Assignment()
             elif method.startswith("rm") and method.endswith("cert"):
@@ -466,6 +528,9 @@ def main():
         print(line + f" ({time.time() - t0:.0f}s)", flush=True)
         if method.startswith(("rm", "combo")):
             print(f"           per-batch (iter, beta, skill_z): {traj}", flush=True)
+        if method == "certified" and est:
+            err = sig.sig2 - true_sig2
+            print(f"           sigma_i^2 estimate at end: bias={err.mean():+.3f} max|err|={np.abs(err).max():.3f}", flush=True)
         if diag:
             print(f"           (iter, true delta of proposal, est. delta (decayed), z*SE): {diag}", flush=True)
         if grouped_frac:
