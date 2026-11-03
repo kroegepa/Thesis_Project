@@ -64,6 +64,7 @@ reward_perturbation_outlier_value: 10.0
 #   reward_model      warm-up free: regress noisy rewards on (o, a[, o']) and group agents with
 #                     similar predicted rewards (see reward_model_* below)
 #   reward_model_only baseline: replace rewards with the learned reward model
+#   certified         reward-model proposals used only once certified from the noisy data (see certify_*)
 grouping_method: "none"
 # Consensus function C: "mean", "median", "trimmed_mean" or "auto" (mean for "normal", median otherwise)
 consensus: "auto"
@@ -106,6 +107,22 @@ reward_model_heads: 1
 # z-test on the previous batch). Prevents an untrained model from degenerating into global
 # grouping, which erases the credit of rare reward events. 0 disables the gate
 reward_model_min_skill_z: 3.0
+# --- grouping_method=certified (certified consensus) ---
+# Reward-model proposals (merge agents with grouping_epsilon-close predicted rewards, optionally only
+# within persistent identity clusters) are used only once out-of-sample statistics certify that the
+# merged agents' mean squared reward difference is <= grouping_epsilon^2 (upper confidence bound).
+# Recommended: grouping_use_next_obs=True grouping_epochs=1.
+# Confidence of the certification, in standard errors (one-sided)
+certify_z: 1.0
+# Memory of the certification statistics (per-iteration decay)
+certify_decay: 0.5
+# Known noise std of the reward perturbation. null: noise-variance-free mode (per-agent variances
+# estimated from residual temporal differences, identity clusters from lag-1 statistics). To use the
+# configured perturbation: experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'
+certify_noise_std: null
+# In noise-variance-free mode, also require the reward model to beat a constant out of sample
+# (reward_model_min_skill_z); guards against not-yet-learned single-step reward events
+certify_skill_gate: True
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8

@@ -15,6 +15,7 @@ Evaluation always uses the true environment rewards.
 | `perturbation.py` | Gaussian and Bernoulli reward kernels |
 | `consensus.py` | mean / median / trimmed-mean / soft (weighted) / residual consensus |
 | `clustering.py` | thresholds, sorted GMM, 1-D k-means, ε-gap clustering |
+| `certification.py` | statistics for certified consensus (rule certification, identity clusters, noise variances) |
 | `models.py` | `TransitionNet`: `(o, a[, o']) -> logits or reward` (CNN or MLP) |
 | `groupers.py` | grouping methods (see below) |
 | `metrics.py` | permutation-invariant grouping metrics and reward-error diagnostics |
@@ -31,6 +32,7 @@ Evaluation always uses the true environment rewards.
 | `gmm` | no | classifier on GMM clusters of the noisy rewards (paper "No-Warmup") |
 | `reward_model` | no | regress the noisy rewards on `(o, a[, o'])`, group on the predictions |
 | `reward_model_only` | no | reward-estimation baseline: replace rewards with the reward model |
+| `certified` | no | **certified consensus**: reward-model proposals used only once the noisy data certify them (below) |
 
 The learned groupers default to `grouping_out_of_sample=True`: the groups of
 iteration k come from parameters fitted on iterations < k, so they do not depend on
@@ -52,6 +54,48 @@ Diagnostics with `evaluate_grouping=True` (they use the true rewards, analysis o
 - `pair_precision` / `pair_recall` against the oracle partition;
 - `level*_bias`, MSE before and after correction;
 - `grouper/skill_z`.
+
+## Certified consensus (`grouping_method=certified`)
+
+Groupings are only applied once the noisy data certify them. With additive, zero-mean
+noise that is independent across agents and steps:
+
+    E[(r~_i - r~_j)^2] = E[(r_i - r_j)^2] + s_i^2 + s_j^2
+
+The noise shape does not matter, and per-agent variances s_i^2 are allowed. Each iteration:
+
+1. **Propose.** The reward model, fitted on *earlier* batches, proposes merging agents of
+   a step whose predicted rewards are ε-close. A second proposal does the same only
+   within persistent identity clusters (roles/teams found from cross-agent statistics).
+2. **Certify.** Each proposal rule is scored on later batches by the mean of the
+   statistic above over the pairs it merges. A rule is used only if the upper confidence
+   bound (`certify_z` SEs) is ≤ ε². Among certified rules, the one that merges most is
+   applied; otherwise rewards are left unchanged. With high probability, the RMS bias of
+   the consensus is then ≤ ε.
+3. **Identity clusters only restrict merges.** At high noise, rare single-step reward
+   events are invisible in reward statistics, so merges must be vetted by the model.
+
+Noise variance:
+
+- `certify_noise_std=<std>`: known noise. To tie it to the simulated perturbation, use
+  `experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'`.
+- `certify_noise_std=null` (default): noise-variance-free mode.
+  - Per-agent variances come from temporal differences of the model residuals.
+  - Identity clusters come from lag-1 statistics, which contain no noise term.
+  - The reward model must also beat a constant out of sample (`certify_skill_gate`).
+  - Limitation: single-step reward events the model has not yet learned are
+    indistinguishable from noise, so this mode certifies somewhat earlier than the
+    known-σ mode. In the offline tests it kept 0.77–0.85 of within-step credit in
+    Pursuit vs 0.95 with known σ.
+
+Recommended: `grouping_use_next_obs=True grouping_epochs=1`. ε (`grouping_epsilon`) is the
+tolerance of Assumption 1 in reward units. It is also an "erasure budget": events with
+rate p and size Δ may be averaged away if p·Δ² ≤ ε².
+
+Logged (`reward_robustness/grouper/*`):
+- `certified_rule` (0 none, 1 `pred`, 2 `pred_in_id`);
+- `pred_delta` / `pred_margin` (estimate and z·SE);
+- `identity_clusters`, `noise_var_mean`, `skill_z`.
 
 ## Migrating from the old flags
 

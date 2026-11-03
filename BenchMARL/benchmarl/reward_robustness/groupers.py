@@ -18,6 +18,9 @@ Methods (``grouping_method`` in the experiment config):
                           are similar (k-means / ε-gap / kernel weights), optionally with
                           residual consensus
 ``reward_model_only``     baseline: replace rewards by the learned reward model
+``certified``             **certified consensus**: reward-model proposals (optionally restricted to
+                          persistent identity clusters) used only once out-of-sample statistics
+                          certify that merged agents' squared reward difference is <= ε²
                           (reward-estimation baseline in the spirit of Romoff et al. 2018)
 ========================  ===============================================================
 
@@ -72,6 +75,10 @@ class GroupingConfig:
     reward_model_heads: int = 1
     reward_model_min_skill_z: float = 3.0
     epsilon: float = 0.5
+    certify_z: float = 1.0
+    certify_decay: float = 0.5
+    certify_noise_std: Optional[float] = None
+    certify_skill_gate: bool = True
 
 
 @dataclass
@@ -79,8 +86,9 @@ class GroupData:
     """Transitions of one agent group for one iteration.
 
     Shapes: ``obs``/``next_obs`` ``[B, T, A, *obs_shape]``, ``action`` ``[B, T, A, act_dim]``
-    (encoded, float), ``reward``/``mask`` ``[B, T, A]``. ``true_reward`` is only
-    available to the oracle, the warm-up phase and the diagnostics.
+    (encoded, float), ``reward``/``mask`` ``[B, T, A]``, ``done`` ``[B, T]`` (episode ended
+    after step t; consecutive steps run along T). ``true_reward`` is only available to
+    the oracle, the warm-up phase and the diagnostics.
     """
 
     obs: torch.Tensor
@@ -89,6 +97,7 @@ class GroupData:
     reward: torch.Tensor
     mask: torch.Tensor
     true_reward: Optional[torch.Tensor] = None
+    done: Optional[torch.Tensor] = None
 
     @property
     def obs_shape(self):
@@ -385,11 +394,14 @@ class RewardModelGrouper(_NetworkGrouper):
             return (per_head * weights).sum() / weights.sum().clamp(min=1)
         return per_head.mean()
 
-    def update(self, data: GroupData) -> Dict[str, float]:
+    def update(self, data: GroupData, pred_out: Optional[torch.Tensor] = None) -> Dict[str, float]:
         logs = {}
         if self.n_updates > 0:
             with torch.no_grad():
-                pred, std = self.predict_mean_std(data)
+                if pred_out is None or self.out_dim > 1:
+                    pred, std = self.predict_mean_std(data)
+                else:
+                    pred, std = pred_out, None
                 resid = (data.reward - pred)[data.mask]
             # Out-of-sample residual variance: sigma^2 + model error (upper bound on sigma^2)
             logs["grouper/residual_var"] = resid.var().item() if resid.numel() > 1 else 0.0
@@ -454,6 +466,136 @@ def assignment_from_predictions(
     return Assignment(labels=labels, offset=offset, active=confident)
 
 
+class CertifiedGrouper(RewardModelGrouper):
+    """Certified consensus: groupings are only used once the data certify them.
+
+    Each iteration (all out of sample):
+
+    1. *Proposals* from the reward model fitted on earlier noisy rewards: merge agents of
+       a step whose predicted rewards are epsilon-close (``pred``), and the same restricted
+       to persistent identity clusters (``pred_in_id``, if any exist).
+    2. *Certification*: every proposal rule is scored on later batches by the mean of
+       ``(r~_i - r~_j)^2 - s_i^2 - s_j^2`` over the same-step pairs it merges (an unbiased
+       estimate of their squared reward difference). Only rules whose upper confidence
+       bound (``certify_z`` standard errors) is <= epsilon^2 may be used; among those, the
+       rule that merges most agents is applied. Otherwise rewards are left unchanged.
+    3. Identity clusters can only *restrict* merges: they are blind to rare, short-lived
+       reward events, which at high noise are invisible in reward statistics.
+
+    Noise variances ``s_i^2``: ``certify_noise_std`` if given (known noise), otherwise
+    estimated per agent from temporal differences of the model residuals, and identity
+    clusters use lag-1 statistics that need no noise variance. In that mode the
+    noise-free skill test of the reward model (``reward_model_min_skill_z``) must also pass
+    (``certify_skill_gate``), because unexplained single-step reward events inflate the
+    variance estimate (see :mod:`benchmarl.reward_robustness.certification`).
+    """
+
+    RULES = ("pred", "pred_in_id")
+
+    def __init__(self, cfg: GroupingConfig, spec: TaskSpec, device="cpu"):
+        super().__init__(cfg, spec, device)
+        from benchmarl.reward_robustness.certification import (
+            IdentityStructure,
+            NoiseVarianceEstimator,
+            RuleCertifier,
+        )
+
+        self.rules = {
+            r: RuleCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay) for r in self.RULES
+        }
+        self.identity = IdentityStructure(cfg.epsilon, z=cfg.certify_z)
+        self.noise = NoiseVarianceEstimator()
+        self.active_rule = "-"
+
+    @property
+    def known_noise(self) -> bool:
+        return self.cfg.certify_noise_std is not None
+
+    def noise_variance(self, n_agents: int) -> Optional[torch.Tensor]:
+        if self.known_noise:
+            return torch.full((n_agents,), float(self.cfg.certify_noise_std) ** 2)
+        return self.noise.variance
+
+    def proposals(self, pred: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        props = {"pred": epsilon_labels(pred, self.cfg.epsilon, mask=mask)}
+        a = pred.shape[-1]
+        if self.identity.labels is not None and self.identity.n_clusters < a:
+            ident = torch.as_tensor(self.identity.labels, device=pred.device).expand_as(pred)
+            within = torch.full_like(ident, -1)
+            for g in ident.unique().tolist():
+                m = (ident == g) & mask
+                within = torch.where(m, epsilon_labels(pred, self.cfg.epsilon, mask=m) + g * a, within)
+            props["pred_in_id"] = within
+        return props
+
+    @staticmethod
+    def _mean_group_size(labels: torch.Tensor) -> float:
+        lab = labels.reshape(-1, labels.shape[-1])
+        same = (lab.unsqueeze(-1) == lab.unsqueeze(-2)) & (lab >= 0).unsqueeze(-1)
+        return same.float().sum(-1).mean().item()
+
+    def _select(self, props: Dict[str, torch.Tensor]) -> Tuple[str, Assignment]:
+        allowed = self.known_noise or not self.cfg.certify_skill_gate or self.skilled
+        cands = [(r, lab) for r, lab in props.items() if allowed and self.rules[r].certified]
+        if not cands:
+            return "-", Assignment()
+        rule, lab = max(cands, key=lambda c: self._mean_group_size(c[1]))
+        return rule, Assignment(labels=lab)
+
+    def assign(self, data: GroupData) -> Assignment:
+        if self.n_updates == 0:
+            return Assignment()
+        return self._select(self.proposals(self.predict_rewards(data), data.mask))[1]
+
+    def __call__(self, data: GroupData) -> Tuple[Assignment, Dict[str, float]]:
+        logs: Dict[str, float] = {}
+        assignment, pred = Assignment(), None
+        n_agents = data.reward.shape[-1]
+        if self.n_updates > 0:
+            pred = self.predict_rewards(data)  # model fitted on earlier batches only
+            props = self.proposals(pred, data.mask)
+            self.active_rule, assignment = self._select(props)
+            var = self.noise_variance(n_agents)
+            if var is not None:  # certify the rules on this batch, for later batches
+                for r, lab in props.items():
+                    self.rules[r].update(lab, data.reward, var, data.mask)
+            self.noise.update(data.reward - pred, data.mask, data.done)
+        self.identity.update(
+            data.reward,
+            data.mask,
+            data.done,
+            noise_var=self.noise_variance(n_agents) if self.known_noise else None,
+        )
+        logs.update(super().update(data, pred_out=pred))
+        logs["grouper/certified_rule"] = float(["-", *self.RULES].index(self.active_rule))
+        logs["grouper/identity_clusters"] = float(self.identity.n_clusters)
+        for r, cert in self.rules.items():
+            delta, margin = cert.stats()
+            logs[f"grouper/{r}_delta"] = delta
+            logs[f"grouper/{r}_margin"] = margin
+        if self.noise.variance is not None:
+            logs["grouper/noise_var_mean"] = self.noise.variance.mean().item()
+        return assignment, logs
+
+    def state_dict(self) -> Dict:
+        state = super().state_dict()
+        if state:
+            state.update(
+                rules={r: c.state_dict() for r, c in self.rules.items()},
+                identity=self.identity.state_dict(),
+                noise=self.noise.state_dict(),
+            )
+        return state
+
+    def load_state_dict(self, state: Dict) -> None:
+        super().load_state_dict(state)
+        if state:
+            for r, c in self.rules.items():
+                c.load_state_dict(state["rules"][r])
+            self.identity.load_state_dict(state["identity"])
+            self.noise.load_state_dict(state["noise"])
+
+
 class RewardModelOnlyGrouper(RewardModelGrouper):
     """Baseline: use the learned reward model ``f(o, a[, o'])`` as the reward."""
 
@@ -467,6 +609,7 @@ GROUPERS = {
     "gmm": GMMClassifierGrouper,
     "reward_model": RewardModelGrouper,
     "reward_model_only": RewardModelOnlyGrouper,
+    "certified": CertifiedGrouper,
 }
 
 

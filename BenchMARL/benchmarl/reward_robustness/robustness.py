@@ -82,6 +82,10 @@ class RewardRobustness:
             reward_model_residual=config.reward_model_residual,
             reward_model_heads=config.reward_model_heads,
             reward_model_min_skill_z=config.reward_model_min_skill_z,
+            certify_z=config.certify_z,
+            certify_decay=config.certify_decay,
+            certify_noise_std=config.certify_noise_std,
+            certify_skill_gate=config.certify_skill_gate,
             epsilon=config.grouping_epsilon,
         )
         self.grouper: Optional[Grouper] = (
@@ -111,6 +115,9 @@ class RewardRobustness:
         reward = batch.get(("next", g, "reward")).squeeze(-1)
         mask = batch.get((g, "mask"), None)
         mask = torch.ones_like(reward, dtype=torch.bool) if mask is None else mask.bool()
+        done = batch.get(("next", "done"), None)
+        if done is not None:
+            done = done.reshape(reward.shape[:2]).bool()
         return GroupData(
             obs=batch.get((g, "observation")),
             next_obs=batch.get(("next", g, "observation")),
@@ -118,6 +125,7 @@ class RewardRobustness:
             reward=reward,
             mask=mask,
             true_reward=true_reward,
+            done=done,
         )
 
     # --------------------------------------------------------------- interface

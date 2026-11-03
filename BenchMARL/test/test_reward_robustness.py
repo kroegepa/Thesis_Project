@@ -28,6 +28,11 @@ from benchmarl.reward_robustness.metrics import (
     pairwise_grouping_scores,
     reward_error_metrics,
 )
+from benchmarl.reward_robustness.certification import (
+    IdentityStructure,
+    NoiseVarianceEstimator,
+    RuleCertifier,
+)
 from benchmarl.reward_robustness.perturbation import perturb_rewards
 from benchmarl.reward_robustness.task_spec import get_task_spec
 
@@ -285,3 +290,100 @@ def test_perturbation_kernels():
     assert abs((flipped != 0).float().mean().item() - 0.1) < 0.01
     with pytest.raises(ValueError):
         perturb_rewards(r, "uniform")
+
+
+def _team_rewards(b=4, t=500, a=6, offset=2.0, sigma=1.0, seed=0):
+    """Two persistent teams (agents 0-2, 3-5); team 2 has a reward offset; rewards change slowly."""
+    g = torch.Generator().manual_seed(seed)
+    common = torch.randn(b, t // 50, 1, generator=g).repeat_interleave(50, dim=1)
+    true = common.expand(b, t, a).clone()
+    true[..., 3:] += offset
+    scales = torch.linspace(0.6, 1.4, a) * sigma
+    noisy = true + torch.randn(b, t, a, generator=g) * scales
+    return true, noisy, scales ** 2
+
+
+class TestCertification:
+    def test_rule_certifier(self):
+        true, noisy, var = _team_rewards()
+        good, bad = RuleCertifier(0.5), RuleCertifier(0.5)
+        labels_good = torch.tensor([0, 0, 0, 1, 1, 1]).expand_as(true)
+        good.update(labels_good, noisy, var)
+        bad.update(torch.zeros_like(labels_good), noisy, var)
+        assert abs(good.stats()[0]) < 0.1 and good.certified
+        assert bad.stats()[0] > 1.5 and not bad.certified  # 9 of 15 pairs differ by 2
+
+    @pytest.mark.parametrize("known_noise", [True, False])
+    def test_identity_structure_finds_teams(self, known_noise):
+        true, noisy, var = _team_rewards()
+        ident = IdentityStructure(0.5)
+        mask = torch.ones_like(true, dtype=torch.bool)
+        ident.update(noisy, mask, noise_var=var if known_noise else None)
+        lab = ident.labels
+        assert lab[0] == lab[1] == lab[2] and lab[3] == lab[4] == lab[5] and lab[0] != lab[3]
+
+    def test_identity_structure_no_false_merges_on_independent_rewards(self):
+        g = torch.Generator().manual_seed(1)
+        true = torch.randn(4, 500, 4, generator=g).repeat_interleave(1, dim=1) * 2
+        noisy = true + torch.randn(4, 500, 4, generator=g)
+        ident = IdentityStructure(0.5)
+        ident.update(noisy, torch.ones_like(noisy, dtype=torch.bool), noise_var=torch.ones(4))
+        assert ident.n_clusters == 4
+
+    def test_noise_variance_estimator(self):
+        true, noisy, var = _team_rewards(t=2000)
+        est = NoiseVarianceEstimator()
+        est.update(noisy, torch.ones_like(noisy, dtype=torch.bool))
+        assert torch.allclose(est.variance, var, rtol=0.15)
+
+
+def _fake_data_big(seed, sigma=1.0):
+    d = _fake_pursuit_data(n_env=8, t=100, a=6, sigma=0.0, seed=seed)
+    torch.manual_seed(seed + 100)
+    d.reward = d.true_reward + sigma * torch.randn_like(d.true_reward)
+    return d
+
+
+class TestCertifiedGrouper:
+    spec = get_task_spec("pursuit")
+
+    def _run(self, cfg, n=6):
+        torch.manual_seed(0)
+        grouper = make_grouper(cfg, self.spec)
+        history = []
+        for seed in range(n):
+            data = _fake_data_big(seed)
+            assignment, logs = grouper(data)
+            history.append((data, assignment, logs))
+        return grouper, history
+
+    def test_known_noise_certifies_and_corrects(self):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0)
+        grouper, hist = self._run(cfg)
+        first = hist[0][1]
+        assert first.labels is None  # nothing certified before any data
+        data, assignment, logs = hist[-1]
+        assert assignment.labels is not None and logs["grouper/certified_rule"] > 0
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        assert ((corrected - data.true_reward) ** 2).mean() < 0.6 * ((data.reward - data.true_reward) ** 2).mean()
+        truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+        assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.95
+
+    def test_noise_free_mode_runs_and_is_safe(self):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True)
+        grouper, hist = self._run(cfg)
+        for data, assignment, _ in hist:
+            if assignment.labels is not None:
+                truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+                assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.9
+        assert grouper.noise.variance is not None
+
+    def test_state_dict_roundtrip(self):
+        cfg = GroupingConfig(method="certified", epochs=1, certify_noise_std=1.0)
+        g1, _ = self._run(cfg, n=3)
+        g2 = make_grouper(cfg, self.spec)
+        g2.load_state_dict(g1.state_dict())
+        assert g2.rules["pred"].state_dict() == g1.rules["pred"].state_dict()
+        assert (g2.identity.labels == g1.identity.labels).all()
+        data = _fake_data_big(9)
+        assert torch.allclose(g1.predict_rewards(data), g2.predict_rewards(data))
