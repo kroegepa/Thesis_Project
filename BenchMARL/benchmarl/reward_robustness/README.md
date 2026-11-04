@@ -125,6 +125,11 @@ Extensions:
   - Pursuit: mostly co-located pursuers taking the same action; it removes 1–34% of the
     noise variance with the transition key, 4–54% with the o' key.
   - No-op for continuous observations.
+- `certify_residual=True`: also certify residual rules (consensus on r̃ − f, with f added back).
+  Merged agents then need equal model errors rather than equal rewards. This did **not**
+  help in our tests: models trained on noisy rewards under-predict rare events, so
+  merging whole steps on residuals spends the ε budget on event credit (Pursuit β 0.79 vs
+  0.86).
 - `certify_replicate_key=next_obs`: replicates on o' only. This assumes the reward is a
   function of o', which is stronger, and gives ~2× more replicates early, so σ̂² is
   precise sooner (Pursuit warm start: certified from iteration 6 instead of 10). In

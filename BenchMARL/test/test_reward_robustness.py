@@ -407,6 +407,21 @@ class TestCertifiedGrouper:
         for d, a, _ in hist:
             assert a.replace is not None
 
+    def test_residual_rules_merge_whole_steps_once_the_model_is_good(self):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0, certify_residual=True)
+        grouper, hist = self._run(cfg, n=8)
+        assert set(grouper.rules) >= {"pred", "res_pred", "res_all"}
+        data, assignment, logs = hist[-1]
+        # fake data: the model learns the reward exactly, so equal model errors hold across all agents
+        assert grouper.active_rule == "res_all" and logs["grouper/residual_active"] == 1.0
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        err = ((corrected - data.true_reward) ** 2).mean()
+        assert err < 0.3 * ((data.reward - data.true_reward) ** 2).mean()
+        # plain rules on the same data merge only equal-reward agents: larger error
+        plain, hist_plain = self._run(GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0), n=8)
+        d2, a2, _ = hist_plain[-1]
+        assert err < ((apply_consensus(d2.reward, a2, d2.mask) - d2.true_reward) ** 2).mean()
+
     def test_unknown_noise_estimator(self):
         with pytest.raises(ValueError):
             make_grouper(GroupingConfig(method="certified", certify_noise_estimator="magic"), self.spec)

@@ -643,6 +643,57 @@ training.
   variance is estimable, so ε² could be set to a fraction of it. Certification would
   then need ~(1/κ)² more contrasts, which is too slow at σ = 3.5.
 
+#### 3.4.6 Third round: residual rules, calibration, Bernoulli corruption
+
+**Residual certified rules** (`certify_residual`, negative).
+- *Idea:* certify consensus on residuals r̃ − f and add f back. Merged agents then need
+  equal model *errors*, not equal rewards. Once the model is good, whole steps (`res_all`)
+  could be merged, including event agents that otherwise sit in small groups, and
+  temporal merging could pass through predicted spikes.
+- *Result:* Pursuit σ=3.5, known σ, 2 clean batches + temporal 5: pooled within SNR
+  **0.53 at β 0.79**, vs **0.74 at β 0.86** with plain rules. σ-free (o′ key + replicate
+  consensus): 0.21 at β 0.83, vs 0.25 at β 0.94. SimpleSpread and roles: unchanged.
+- *Why:* even a warm-started model under-predicts captures (event RMS error 1.5–3.8,
+  others 0.04–0.3). So `res_all` sits right at the budget (pair statistic 0.15–0.32 vs
+  ε² = 0.25), and "merge most" spends the whole erasure budget on event credit. Plain
+  ε-groups have 0.01–0.11.
+- Residual consensus needs accurate event predictions, which a model trained on noisy
+  rewards does not provide. Kept as an option, off by default.
+
+**Calibrating the predictions** (isotonic, cross-fitted on the noisy rewards; negative).
+The slope of the true reward on the prediction varies from 0.4 to 1.5 between batches;
+predictions are not systematically compressed. ε-groups on calibrated predictions
+certify no better. During the cold start the model predicts nearly the same value for
+all 16 agents, and that group's bias (0.2–0.55) is what blocks certification.
+
+**The paper's Bernoulli kernel** (each reward replaced by ±10 with p = 0.1; not
+mean-preserving, E[r̃] = 0.9·r). Offline, σ-free (replicates); within-step SNR pooled
+(iterations ≥ 13 in brackets) and β:
+
+| Pursuit | none | oracle mean | oracle median | global median | certified mean | certified median |
+|---|---|---|---|---|---|---|
+| within SNR | 0.14 (0.16) | 0.41 (0.47) | **0.86 (0.89)** | 0.00 | 0.15 (0.26) | 0.16 (0.29) |
+| β | 0.90 | 0.90 | 1.01 | 0 | 0.84 | 0.87 |
+
+| SimpleSpread | none | oracle mean | oracle median | global median | certified mean | certified median (+T5) |
+|---|---|---|---|---|---|---|
+| common SNR | 0.14 | 0.29 | 0.70 | 1.02 | 0.16 | 0.17 (0.18) |
+
+- **Still valid.** The certification identity only needs zero-mean independent noise.
+  The replacement kernel adds an r²-dependent term p(1−p)(rᵢ² + rⱼ²) that the pooled σ̂²
+  removes on average. The replicate σ² is unbiased (ratio 1.00 ± 1%), and there are no
+  false certifications.
+- **But slow.** Heavy tails (E[ξ⁴] = p·10⁴ vs 3σ⁴) make the pair statistic ~3× noisier.
+  Certification starts at iteration 14 in Pursuit and flickers in SimpleSpread, where it
+  is barely better than no correction.
+- **Median inside certified groups is better than mean**, as in the paper. The
+  oracle-median bound (0.86) shows how much there is to gain once groups are known.
+- **Global median wins on the shared signal but erases all individual credit (β = 0).**
+  This is the Byzantine-baseline caveat Reviewer 3 should see.
+- **For the paper:** certified consensus covers Bernoulli corruption without
+  modification, but needs more data. Under heavy-tailed corruption, the paper's median
+  consensus on *certified* groups is the right combination.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)

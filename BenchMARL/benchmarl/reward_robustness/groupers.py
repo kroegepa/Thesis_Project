@@ -81,6 +81,7 @@ class GroupingConfig:
     certify_noise_estimator: str = "replicates"
     certify_replicate_key: str = "transition"
     certify_replicate_consensus: bool = False
+    certify_residual: bool = False
     certify_skill_gate: bool = True
     certify_temporal_window: int = 0
     certify_ivw: bool = False
@@ -505,6 +506,12 @@ class CertifiedGrouper(RewardModelGrouper):
 
     Options:
 
+    * ``certify_residual``: also propose *residual* rules (consensus on ``r~ - f`` with the model
+      prediction f added back): merged agents then need equal model errors rather than equal
+      rewards, so once the model is good whole steps (``res_all``) or identity clusters
+      (``res_id``) can be merged, including agents with rare events, and temporal merging works
+      through predicted spikes (unvetted neighbours, certified on residual differences). Residual
+      and plain rules are certified side by side; the one that merges most is used.
     * ``certify_replicate_consensus``: first average the noisy rewards of all samples in the batch
       with identical replicate keys (``certify_replicate_key``: the transition (o, a, o'), or o'
       only). Under local determinism this has zero bias, so it is applied from the first
@@ -522,6 +529,7 @@ class CertifiedGrouper(RewardModelGrouper):
     """
 
     RULES = ("pred", "pred_in_id")
+    RESIDUAL_RULES = ("res_pred", "res_pred_in_id", "res_id", "res_all")
     WARMUP_EPOCHS = 10
 
     def __init__(self, cfg: GroupingConfig, spec: TaskSpec, device="cpu"):
@@ -534,8 +542,9 @@ class CertifiedGrouper(RewardModelGrouper):
             TemporalCertifier,
         )
 
+        self.rule_names = self.RULES + (self.RESIDUAL_RULES if cfg.certify_residual else ())
         self.rules = {
-            r: RuleCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay) for r in self.RULES
+            r: RuleCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay) for r in self.rule_names
         }
         if cfg.certify_noise_estimator not in ("replicates", "temporal"):
             raise ValueError(f"Unknown certify_noise_estimator '{cfg.certify_noise_estimator}'")
@@ -544,7 +553,10 @@ class CertifiedGrouper(RewardModelGrouper):
         # common sigma^2 from replicated transitions
         self.replicates = ReplicateNoiseEstimator(z=cfg.certify_z, key=cfg.certify_replicate_key)
         self.temporal = TemporalCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay)
+        # residual temporal merging: unvetted neighbours, certified on r~ - f
+        self.temporal_res = TemporalCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay)
         self.active_rule = "-"
+        self.residual_active = False
         self.temporal_active = False
         if cfg.certify_temporal_window >= 3 and self._noise_source == "temporal":
             import warnings
@@ -601,7 +613,7 @@ class CertifiedGrouper(RewardModelGrouper):
             return
         est, se = self.replicates.estimate()
         offset, offset_se = (0.0, 0.0) if est is None else (2.0 * est, 2.0 * se)
-        for cert in [*self.rules.values(), self.temporal]:
+        for cert in [*self.rules.values(), self.temporal, self.temporal_res]:
             cert.set_noise_offset(offset, offset_se)
 
     def proposals(self, pred: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -614,7 +626,20 @@ class CertifiedGrouper(RewardModelGrouper):
                 m = (ident == g) & mask
                 within = torch.where(m, epsilon_labels(pred, self.cfg.epsilon, mask=m) + g * a, within)
             props["pred_in_id"] = within
+        if self.cfg.certify_residual:
+            # residual rules: consensus on r~ - f, so merged agents need equal model *errors*, not equal
+            # rewards (certified on residuals); f is added back afterwards
+            props["res_pred"] = props["pred"]
+            if "pred_in_id" in props:
+                props["res_pred_in_id"] = props["pred_in_id"]
+                ident = torch.as_tensor(self.identity.labels, device=pred.device).expand_as(pred)
+                props["res_id"] = torch.where(mask, ident, torch.full_like(ident, -1))
+            props["res_all"] = torch.where(mask, torch.zeros_like(props["pred"]), torch.full_like(props["pred"], -1))
         return props
+
+    @staticmethod
+    def is_residual(rule: str) -> bool:
+        return rule.startswith("res_")
 
     @staticmethod
     def _mean_group_size(labels: torch.Tensor) -> float:
@@ -629,14 +654,23 @@ class CertifiedGrouper(RewardModelGrouper):
         cands = [(r, lab) for r, lab in props.items() if allowed and self.rules[r].certified]
         if not cands:
             return "-", Assignment()
-        rule, lab = max(cands, key=lambda c: self._mean_group_size(c[1]))
+
+        def key(c):  # merge most; on ties (same groups, plain vs residual) the smaller certified bound
+            delta, margin = self.rules[c[0]].stats()
+            return self._mean_group_size(c[1]), -(delta + margin)
+
+        rule, lab = max(cands, key=key)
         return rule, Assignment(labels=lab)
 
     def assign(self, data: GroupData) -> Assignment:
         if self.n_updates == 0:
             return Assignment()
         self._sync_noise_offsets()
-        return self._select(self.proposals(self.predict_rewards(data), data.mask))[1]
+        pred = self.predict_rewards(data)
+        rule, assignment = self._select(self.proposals(pred, data.mask))
+        if self.is_residual(rule):
+            assignment.offset = pred
+        return assignment
 
     def _corrected(
         self,
@@ -645,9 +679,12 @@ class CertifiedGrouper(RewardModelGrouper):
         var: Optional[torch.Tensor],
         neighbours,
         base: Optional[torch.Tensor] = None,
+        offset: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Corrected rewards when replicate consensus, IVW or temporal merging is active (else None:
-        plain labels). ``base``: replicate-consensus rewards, used in place of the noisy rewards."""
+        """Corrected rewards when replicate consensus, IVW, temporal merging or a residual rule is
+        active (else None: plain labels). ``base``: replicate-consensus rewards, used in place of the
+        noisy rewards. ``offset``: model predictions f; merges then act on ``base - f``, and f is
+        added back (residual consensus)."""
         from benchmarl.reward_robustness.certification import temporal_average
         from benchmarl.reward_robustness.consensus import apply_consensus
 
@@ -657,9 +694,11 @@ class CertifiedGrouper(RewardModelGrouper):
             var = self.noise.variance
         use_ivw = self.cfg.certify_ivw and var is not None and labels is not None
         use_temporal = neighbours is not None
-        if not (use_ivw or use_temporal or base is not None):
+        if not (use_ivw or use_temporal or base is not None or offset is not None):
             return None
         x = data.reward if base is None else base
+        if offset is not None:
+            x = x - offset
         if labels is None:
             values = x.clone()
         elif use_ivw:
@@ -670,7 +709,7 @@ class CertifiedGrouper(RewardModelGrouper):
             values = apply_consensus(x, Assignment(labels=labels), data.mask, method=self.cfg.consensus)
         if use_temporal:
             values = temporal_average(values, neighbours)
-        return values
+        return values if offset is None else values + offset
 
     def __call__(self, data: GroupData) -> Tuple[Assignment, Dict[str, float]]:
         from benchmarl.reward_robustness.certification import replicate_consensus, temporal_neighbours
@@ -690,23 +729,40 @@ class CertifiedGrouper(RewardModelGrouper):
             props = self.proposals(pred, data.mask)
             self.active_rule, assignment = self._select(props)
             var = self.noise_variance(n_agents)
-            neighbours = None
+            residual = self.cfg.certify_residual
+            neighbours = neighbours_res = None
             if self.half_window:
                 neighbours = temporal_neighbours(
                     pred, data.mask, data.done, self.half_window, self.cfg.epsilon
                 )
-                self.temporal_active = self.temporal.certified
+                if residual:  # residual temporal merges need no vetting: certification decides
+                    neighbours_res = temporal_neighbours(pred, data.mask, data.done, self.half_window, None)
+            # residual pipeline: a residual spatial rule, or no spatial rule but residual temporal merging
+            self.residual_active = residual and (
+                self.is_residual(self.active_rule)
+                or (self.active_rule == "-" and self.half_window > 0 and self.temporal_res.certified)
+            )
+            if self.residual_active:
+                self.temporal_active = self.half_window > 0 and self.temporal_res.certified
+                nb, offset = neighbours_res, pred
+            else:
+                self.temporal_active = self.half_window > 0 and self.temporal.certified
+                nb, offset = neighbours, None
             values = self._corrected(
-                data, assignment.labels, var, neighbours if self.temporal_active else None, base
+                data, assignment.labels, var, nb if self.temporal_active else None, base, offset
             )
             if values is not None:
                 assignment = Assignment(labels=assignment.labels, replace=values)
             cert_var = self._update_noise_var(n_agents)
             if cert_var is not None:  # certify the rules on this batch, for later batches
+                resid = data.reward - pred
                 for r, lab in props.items():
-                    self.rules[r].update(lab, data.reward, cert_var, data.mask)
+                    x = resid if self.is_residual(r) else data.reward
+                    self.rules[r].update(lab, x, cert_var, data.mask)
                 if neighbours is not None:
                     self.temporal.update(data.reward, cert_var, neighbours)
+                if neighbours_res is not None:
+                    self.temporal_res.update(resid, cert_var, neighbours_res)
             self.noise.update(data.reward - pred, data.mask, data.done)
         source = self._noise_source
         if source == "temporal":  # no noise variance: lag-1 statistics (blind to single-step events)
@@ -716,7 +772,8 @@ class CertifiedGrouper(RewardModelGrouper):
         if source == "replicates":
             self.replicates.update(data.obs, data.next_obs, data.action, data.reward, data.mask)
         logs.update(super().update(data, pred_out=pred))
-        logs["grouper/certified_rule"] = float(["-", *self.RULES].index(self.active_rule))
+        logs["grouper/certified_rule"] = float(["-", *self.rule_names].index(self.active_rule))
+        logs["grouper/residual_active"] = float(self.residual_active)
         logs["grouper/identity_clusters"] = float(self.identity.n_clusters)
         for r, cert in self.rules.items():
             delta, margin = cert.stats()
@@ -734,6 +791,10 @@ class CertifiedGrouper(RewardModelGrouper):
             logs["grouper/temporal_active"] = float(self.temporal_active)
             logs["grouper/temporal_delta"] = delta
             logs["grouper/temporal_margin"] = margin
+            if self.cfg.certify_residual:
+                delta, margin = self.temporal_res.stats()
+                logs["grouper/temporal_res_delta"] = delta
+                logs["grouper/temporal_res_margin"] = margin
         return assignment, logs
 
     def state_dict(self) -> Dict:
@@ -744,6 +805,7 @@ class CertifiedGrouper(RewardModelGrouper):
                 identity=self.identity.state_dict(),
                 noise=self.noise.state_dict(),
                 temporal=self.temporal.state_dict(),
+                temporal_res=self.temporal_res.state_dict(),
                 replicates=self.replicates.state_dict(),
             )
         return state
@@ -752,11 +814,14 @@ class CertifiedGrouper(RewardModelGrouper):
         super().load_state_dict(state)
         if state:
             for r, c in self.rules.items():
-                c.load_state_dict(state["rules"][r])
+                if r in state["rules"]:
+                    c.load_state_dict(state["rules"][r])
             self.identity.load_state_dict(state["identity"])
             self.noise.load_state_dict(state["noise"])
             if "temporal" in state:
                 self.temporal.load_state_dict(state["temporal"])
+            if "temporal_res" in state:
+                self.temporal_res.load_state_dict(state["temporal_res"])
             if "replicates" in state:
                 self.replicates.load_state_dict(state["replicates"])
             self._sync_noise_offsets()

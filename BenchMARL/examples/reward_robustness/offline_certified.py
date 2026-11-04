@@ -15,8 +15,18 @@ p.add_argument("--team_offset", type=float, default=0.0)
 p.add_argument("--estimator", default="replicates", help="noise estimator when --known 0: replicates | temporal")
 p.add_argument("--rep_key", default="transition"); p.add_argument("--rep_consensus", type=int, default=0)
 p.add_argument("--epochs", type=int, default=1); p.add_argument("--lr", type=float, default=1e-3)
+p.add_argument("--residual", type=int, default=0)
 p.add_argument("--hidden", type=int, default=0, help="override the task's hidden size (0: keep)")
+p.add_argument("--noise", default="gauss", choices=["gauss", "bernoulli"],
+               help="bernoulli: the paper's kernel, each reward replaced by +-outlier with prob --flip")
+p.add_argument("--flip", type=float, default=0.1); p.add_argument("--outlier", type=float, default=10.0)
+p.add_argument("--method", default="certified", choices=["certified", "none", "oracle", "global"])
+p.add_argument("--consensus", default="mean", choices=["mean", "median"])
+p.add_argument("--decay", type=float, default=0.5, help="certify_decay of the rule/temporal certifiers")
+p.add_argument("--eps", type=float, default=0.5)
 args = p.parse_args()
+if args.noise == "bernoulli":  # std of the corruption of a near-zero reward
+    args.sigma = (args.flip ** 0.5) * args.outlier
 stream = load_stream(args.stream, 5)
 import numpy as np
 from explore_general_grouping import composite
@@ -29,7 +39,9 @@ cfg = GroupingConfig(method="certified", use_next_obs=True, epochs=args.epochs, 
                      certify_noise_std=args.sigma if args.known else None,
                      certify_noise_estimator=args.estimator,
                      certify_replicate_key=args.rep_key, certify_replicate_consensus=bool(args.rep_consensus),
-                     certify_temporal_window=args.temporal, certify_ivw=bool(args.ivw))
+                     certify_residual=bool(args.residual),
+                     certify_temporal_window=args.temporal, certify_ivw=bool(args.ivw),
+                     consensus=args.consensus, certify_decay=args.decay, epsilon=args.eps)
 spec = get_task_spec(args.task)
 if args.hidden:
     import dataclasses
@@ -43,10 +55,25 @@ acc, late, used, s2 = Acc(), Acc(), [], []
 t0 = time.time()
 for i, d in enumerate(stream):
     torch.manual_seed(i)
-    d.reward = d.true_reward + args.sigma * scale * torch.randn_like(d.true_reward)
-    a, logs = g(d)
-    c = apply_consensus(d.reward, a, d.mask)
-    used.append(int(logs["grouper/certified_rule"]) + (10 if logs.get("grouper/temporal_active") else 0))
+    if args.noise == "gauss":
+        d.reward = d.true_reward + args.sigma * scale * torch.randn_like(d.true_reward)
+    else:
+        from benchmarl.reward_robustness.perturbation import perturb_rewards
+        d.reward = perturb_rewards(d.true_reward, "bernoulli", flip_prob=args.flip, outlier_value=args.outlier)
+    if args.method == "certified":
+        a, logs = g(d)
+        used.append(g.active_rule + ("+T" if logs.get("grouper/temporal_active") else ""))
+    else:
+        from benchmarl.reward_robustness.consensus import Assignment
+        from benchmarl.reward_robustness.groupers import oracle_labels
+        logs = {}
+        if args.method == "none":
+            a = Assignment()
+        elif args.method == "global":
+            a = Assignment(labels=torch.where(d.mask, 0, -1))
+        else:
+            a = Assignment(labels=oracle_labels(d.true_reward, spec, 3, d.mask))
+    c = apply_consensus(d.reward, a, d.mask, method=args.consensus)
     if "grouper/noise_var_replicates" in logs:
         s2.append((logs["grouper/noise_var_replicates"] / args.sigma ** 2, logs["grouper/noise_var_replicates_se"] / args.sigma ** 2))
     if i % 2 == 1:
@@ -56,8 +83,8 @@ for i, d in enumerate(stream):
 for name, ac in [("all", acc), (f"iter>={args.late}", late)]:
     s = ac.summary()
     tag = "known" if args.known else args.estimator
-    print(f"sigma_src={tag} key={args.rep_key} repcons={args.rep_consensus} ep={args.epochs} lr={args.lr} warm={args.warm} T={args.temporal} ivw={args.ivw} hetero={args.hetero} teams={args.teams} [{name}] snr_common={s['snr_common']:.2f} snr_within={s['snr_within']:.2f} "
+    print(f"{args.method}/{args.consensus} noise={args.noise} sigma_src={tag} key={args.rep_key} repcons={args.rep_consensus} res={args.residual} decay={args.decay} eps={args.eps} ep={args.epochs} lr={args.lr} warm={args.warm} T={args.temporal} ivw={args.ivw} hetero={args.hetero} teams={args.teams} [{name}] snr_common={s['snr_common']:.2f} snr_within={s['snr_within']:.2f} "
           f"beta={s['beta']:.2f} noise={s['noise']:.2f}")
-print(f"   rule per batch (0 none, 1 pred, 2 pred_in_id; +10 temporal): {used}  ({time.time() - t0:.0f}s)")
+print(f"   rule per batch (+T: temporal): {' '.join(used)}  ({time.time() - t0:.0f}s)")
 if s2:
     print(f"   replicate sigma^2 estimate / true (rel. SE) per batch: {' '.join(f'{v:.3f}({100 * e:.1f}%)' for v, e in s2)}")
