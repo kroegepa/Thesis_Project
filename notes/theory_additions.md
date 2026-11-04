@@ -190,3 +190,64 @@ In practice:
    the action-relevant reward gaps (k-means over predictions, or ε-gap with ε a fraction
    of that gap).
 2. Monitor the diagnostics `pair_precision`, `event_contrast` and `level*_bias`.
+
+---
+
+## A7. Certification without knowing σ: homoscedastic noise *(new)*
+
+Certified consensus (§3.4 of the revision plan) checks, for the same-step pairs a rule
+merges, that
+
+$$
+\widehat{\Delta} = \overline{(\tilde r^i_t-\tilde r^j_t)^2} - 2\sigma^2 \le \epsilon^2 ,
+$$
+
+so it needs the noise floor 2σ². This section replaces "σ is known" by two assumptions.
+
+**Assumption 4 (homoscedastic noise).** Var(ξ_tⁱ) = σ² for all agents and steps. The
+noise distribution is otherwise arbitrary (skewed or heavy-tailed noise is fine).
+
+**Assumption 5 (local determinism).** The true reward is a fixed function of the agent's
+local transition: r_tⁱ = R(τ_tⁱ), τ_tⁱ = (o_tⁱ, a_tⁱ, o_{t+1}ⁱ).
+
+**Why Assumption 4 alone is not enough (non-identifiability).** Take any reward process
+r and noise of variance σ². Write r′ = r + η, where η is zero-mean, white in time and
+independent across agents, with variance v ≤ σ², and use noise of variance σ² − v. Both
+give exactly the same distribution of observed rewards. So σ² is only identified up to
+true reward variation that is unexplained and white. That variation is precisely the
+"single-step events" limitation of §3.4.1. Assumption 5 rules it out: every true reward
+difference is explained by an observable.
+
+**Proposition 8 (replicate estimators).** Under Assumptions 2′, 4 and 5:
+1. *Exact replicates.* For two samples u ≠ v with τ_u = τ_v, E[(r̃_u − r̃_v)²] = 2σ².
+   The pure-error estimator over classes c of identical transitions,
+   σ̂² = Σ_c Σ_{u∈c} (r̃_u − r̄_c)² / Σ_c (n_c − 1), is unbiased. With finite fourth
+   moments, its relative standard error is about √((2+κ)/dof), with κ the excess kurtosis.
+2. *Near replicates.* If R is twice differentiable, then for nearest-neighbour pairs at
+   squared distance d², E[(r̃_u − r̃_v)²/2 | d²] = σ² + O(d²). The intercept of a
+   regression of (r̃_u − r̃_v)²/2 on d² over k-NN pairs is consistent for σ²
+   (Tong & Wang, 2005, Biometrika; Devroye et al., 2018).
+
+**Corollary (certification with an estimated noise floor).** Let σ̂² be computed from
+other data than the certification batches, with standard error s_σ. The rule is certified
+if
+
+$$
+\overline{(\tilde r^i-\tilde r^j)^2} - 2\hat\sigma^2 + z\sqrt{\mathrm{SE}^2_{\text{pairs}} + 4 s_\sigma^2} \le \epsilon^2 .
+$$
+
+Then the guarantee of certified consensus (UCB ≤ ε² ⇒ RMS bias of merged pairs ≤ ε,
+revision plan §3.4) holds at the same confidence level (asymptotically). The noise floor can be refined after the fact: the certifier stores
+raw squared differences, and the latest σ̂² is subtracted when certifying.
+
+**Precision requirement.** An error δ in σ² shifts Δ̂ by 2δ. Certifying at tolerance ε
+therefore needs s_σ ≲ ε²/(2z), a relative precision of ε²/(2zσ²): 1% at σ = 3.5,
+ε = 0.5, z = 1. With exact replicates, that is ≈ 2·10⁴ residual degrees of freedom. The
+noise kernel is stationary, so the statistics can be pooled over all iterations.
+
+**Checking Assumption 5.** A violation (reward depends on something outside τ, e.g. a
+team reward triggered out of view) inflates σ̂², which makes certification
+*anti-conservative*. Under Assumptions 4–5, the within-class variance is the same in every
+class. A Levene/Bartlett-type test of within-class variances across bins of the predicted
+reward is a cheap diagnostic: violations typically show up as excess within-class
+variance where events happen.

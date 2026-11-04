@@ -53,18 +53,24 @@ python benchmarl/run.py -m $COMMON \
   experiment.reward_model_assign=kernel experiment.grouping_epsilon=0.5 \
   experiment.reward_model_min_skill_z=0,3 "${@:2}"
 
-# 2b) Certified consensus: known noise std vs noise-variance-free
+# 2b) Certified consensus: known noise std, and sigma-free with the replicate estimator (homoscedastic
+#     noise, reward deterministic in (o, a, o')) or the temporal estimator (per-agent, skill gate)
 python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=certified \
   experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
-  'experiment.certify_noise_std=${experiment.reward_perturbation_stdev},null' "${@:2}"
+  'experiment.certify_noise_std=${experiment.reward_perturbation_stdev}' "${@:2}"
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=certified \
+  experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
+  experiment.certify_noise_std=null experiment.certify_noise_estimator=replicates,temporal "${@:2}"
 
-# 2c) Certified consensus with extensions (known noise std): temporal merging, IVW, and with/without
-#     a 2-iteration clean warm-up of the proposal model
+# 2c) Certified consensus with extensions: temporal merging and IVW, with/without a 2-iteration clean
+#     warm-up of the proposal model; known noise std vs sigma-free (replicate estimator)
 python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=certified \
   experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
-  'experiment.certify_noise_std=${experiment.reward_perturbation_stdev}' \
+  'experiment.certify_noise_std=${experiment.reward_perturbation_stdev},null' \
+  experiment.certify_noise_estimator=replicates \
   experiment.certify_temporal_window=5 experiment.certify_ivw=True \
   experiment.certify_warmup=False,True experiment.warmup_iters=2 "${@:2}"
 

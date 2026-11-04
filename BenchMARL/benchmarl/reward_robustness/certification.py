@@ -17,11 +17,15 @@ where s_i^2 is agent i's noise variance. No Gaussian or symmetric noise is neede
   E[D_t D_{t-1}] with D_t = r~_i,t - r~_j,t, which contain no noise term at all.
 * :class:`NoiseVarianceEstimator` estimates each agent's noise variance from temporal
   differences of reward-model residuals (noise is fresh every step, rewards persist).
+* :class:`ReplicateNoiseEstimator` estimates one common noise variance (homoscedastic
+  noise) from replicated transitions, assuming the true reward is a deterministic function
+  of the local transition (o, a, o'). This avoids the limitation below.
 
 Limitation (identifiability): reward differences that last a single step and are not
 explained by the reward model are, in second-order statistics, indistinguishable from
-noise. Without a known noise variance they inflate the variance estimate and make the
-certification optimistic until the reward model has learned them.
+noise. Without a known noise variance (or an extra assumption such as the replicate one)
+they inflate the variance estimate and make the certification optimistic until the reward
+model has learned them.
 """
 
 from typing import Dict, List, Optional
@@ -52,6 +56,14 @@ class RuleCertifier:
     def __init__(self, epsilon: float, z: float = 1.0, decay: float = 0.5, min_units: float = 10.0):
         self.epsilon, self.z, self.decay, self.min_units = epsilon, z, decay, min_units
         self.w = self.s1 = self.s2 = self.n = 0.0
+        self.offset = self.offset_se = 0.0
+
+    def set_noise_offset(self, offset: float, se: float = 0.0) -> None:
+        """Noise term subtracted at query time (with standard error), for statistics accumulated
+        with ``noise_var=0``. With a common noise variance sigma^2 the pair offset is 2 sigma^2,
+        so an estimated sigma^2 can be refined after the fact and its uncertainty is added in
+        quadrature to the margin."""
+        self.offset, self.offset_se = float(offset), float(se)
 
     def update(
         self,
@@ -91,9 +103,9 @@ class RuleCertifier:
         """(estimated mean squared reward difference of merged pairs, z * SE)."""
         if self.w <= 0:
             return float("nan"), float("nan")
-        mean = self.s1 / self.w
-        var = max(self.s2 / self.w - mean ** 2, 0.0)
-        return mean, self.z * float(np.sqrt(var / max(self.n, 1.0)))
+        raw = self.s1 / self.w
+        var = max(self.s2 / self.w - raw ** 2, 0.0)
+        return raw - self.offset, self.z * float(np.sqrt(var / max(self.n, 1.0) + self.offset_se ** 2))
 
     @property
     def certified(self) -> bool:
@@ -307,14 +319,17 @@ class TemporalCertifier:
     """Certify merging an agent's reward with its own neighbouring steps.
 
     Per merged temporal pair: ``(r~_{i,t+k} - r~_{i,t})^2 - 2 s_i^2`` is unbiased for the squared
-    change of the true reward. Requires a *known* noise variance: a variance estimated from
-    temporal differences already absorbs temporal reward changes, which would make this
-    test vacuous.
+    change of the true reward. Requires a noise variance that does not come from temporal
+    differences (known, or :class:`ReplicateNoiseEstimator`): a variance estimated from temporal
+    differences already absorbs temporal reward changes, which would make this test vacuous.
     """
 
     def __init__(self, epsilon: float, z: float = 1.0, decay: float = 0.5, min_pairs: float = 100.0):
         self.epsilon, self.z, self.decay, self.min_pairs = epsilon, z, decay, min_pairs
         self.n = self.s = self.ss = 0.0
+        self.offset = self.offset_se = 0.0
+
+    set_noise_offset = RuleCertifier.set_noise_offset
 
     def update(self, reward: torch.Tensor, noise_var: torch.Tensor, neighbours: Dict[int, torch.Tensor]) -> None:
         var = torch.as_tensor(noise_var, dtype=torch.float64).expand_as(reward)
@@ -336,8 +351,9 @@ class TemporalCertifier:
     def stats(self):
         if self.n <= 0:
             return float("nan"), float("nan")
-        mean = self.s / self.n
-        return mean, self.z * float(np.sqrt(max(self.ss / self.n - mean ** 2, 0.0) / self.n))
+        raw = self.s / self.n
+        var = max(self.ss / self.n - raw ** 2, 0.0) / self.n
+        return raw - self.offset, self.z * float(np.sqrt(var + self.offset_se ** 2))
 
     @property
     def certified(self) -> bool:
@@ -351,3 +367,119 @@ class TemporalCertifier:
 
     def load_state_dict(self, state: Dict) -> None:
         self.n, self.s, self.ss = state["n"], state["s"], state["ss"]
+
+
+class ReplicateNoiseEstimator:
+    """Common noise variance from (near-)replicated transitions, without knowing sigma.
+
+    Assumptions: the noise variance is the same for all agents (homoscedastic) and the true
+    reward is a deterministic function of the agent's local transition (o, a, o'). Then two
+    samples with the same transition have the same true reward and their noisy rewards differ
+    only by noise:
+
+    * **exact replicates** (pure error, as with replicated design points in regression): the
+      within-class variance of noisy rewards over identical transitions is unbiased for
+      sigma^2. Typical for discrete observations (grid worlds).
+    * **near replicates** (continuous observations, Tong & Wang 2005 style): for sampled query
+      transitions, take their k nearest neighbours in standardised (o, a, o') space and regress
+      (r~_q - r~_nn)^2 / 2 on the squared distance; the intercept estimates sigma^2 for rewards
+      that are smooth in the transition.
+
+    Unlike temporal differences, this compares only (near-)identical transitions, so rare
+    single-step reward events do not inflate the estimate. The noise kernel is stationary, so
+    statistics are pooled over all batches (``decay=1``). :meth:`estimate` returns the estimate
+    and its standard error. Precision matters: certifying a mean squared difference of eps^2
+    against a noise floor of 2 sigma^2 needs sigma^2 to a relative precision of about
+    eps^2 / (2 sigma^2) (1% at sigma = 3.5, eps = 0.5).
+    """
+
+    CHUNK = 2 ** 24  # max distance-matrix entries per block
+
+    def __init__(self, decay: float = 1.0, min_dof: float = 2000.0, k: int = 5, n_query: int = 16000, z: float = 1.0):
+        self.decay, self.min_dof, self.k, self.n_query, self.z = decay, min_dof, k, n_query, z
+        self.dof = self.ss = self.ss_var = 0.0  # exact replicates: pooled dof, SS, var of SS
+        self.knn_w = self.knn_s = 0.0  # near replicates: inverse-variance pooled intercepts
+
+    @staticmethod
+    def _features(obs, next_obs, action, mask):
+        n = mask.numel()
+        f = torch.cat([obs.reshape(n, -1), next_obs.reshape(n, -1), action.reshape(n, -1)], 1).float()
+        return f[mask.reshape(-1)]
+
+    def update(self, obs, next_obs, action, reward, mask) -> None:
+        f = self._features(obs, next_obs, action, mask)
+        x = reward.reshape(-1)[mask.reshape(-1)].double()
+        if x.numel() < 3:
+            return
+        self.dof *= self.decay
+        self.ss *= self.decay
+        self.ss_var *= self.decay ** 2
+        self.knn_w *= self.decay
+        self.knn_s *= self.decay
+        # ---- exact replicates: within-class variance
+        _, inv, cnt = torch.unique(f, dim=0, return_inverse=True, return_counts=True)
+        k = cnt.numel()
+        s1 = torch.zeros(k, dtype=torch.float64, device=x.device).index_add_(0, inv, x)
+        s2 = torch.zeros(k, dtype=torch.float64, device=x.device).index_add_(0, inv, x * x)
+        c = cnt.double()
+        rep = c > 1
+        if bool(rep.any()):
+            ss_c = (s2 - s1 ** 2 / c)[rep]
+            dof_c = (c - 1)[rep]
+            self.dof += dof_c.sum().item()
+            self.ss += ss_c.sum().item()
+            est = ss_c.sum() / dof_c.sum()
+            self.ss_var += ((ss_c - dof_c * est) ** 2).sum().item()  # sandwich variance of SS
+        # ---- near replicates (only needed when exact ones are scarce)
+        if self.dof < self.min_dof:
+            g = (f - f.mean(0)) / f.std(0).clamp(min=1e-6)
+            q = torch.randperm(g.shape[0], device=g.device)[: self.n_query]
+            kk = min(self.k, g.shape[0] - 1)
+            dist, idx = [], []
+            for qc in q.split(max(1, self.CHUNK // g.shape[0])):  # bounded memory
+                d2 = torch.cdist(g[qc], g) ** 2
+                d2[torch.arange(qc.numel(), device=g.device), qc] = float("inf")  # exclude self
+                dc, ic = d2.topk(kk, largest=False)
+                dist.append(dc)
+                idx.append(ic)
+            dist, idx = torch.cat(dist), torch.cat(idx)
+            x = x.to(g.device)
+            h = ((x[q].unsqueeze(1) - x[idx]) ** 2 / 2).reshape(-1)
+            dd = dist.reshape(-1).double()
+            a = torch.stack([torch.ones_like(dd), dd], 1)
+            coef = torch.linalg.lstsq(a, h.unsqueeze(1)).solution.squeeze(1)
+            resid = h - a @ coef
+            cov = torch.linalg.pinv(a.T @ a) * resid.var() * kk  # neighbours share queries: inflate
+            var0 = max(cov[0, 0].item(), 1e-12)
+            self.knn_w += 1.0 / var0
+            self.knn_s += coef[0].item() / var0
+
+    @property
+    def source(self) -> str:
+        if self.dof >= self.min_dof:
+            return "replicates"
+        return "near_replicates" if self.knn_w > 0 else "none"
+
+    def estimate(self):
+        """(sigma^2 estimate, standard error), or (None, None) before any data."""
+        if self.dof >= self.min_dof:
+            return self.ss / self.dof, np.sqrt(self.ss_var) / self.dof
+        if self.knn_w > 0:
+            return self.knn_s / self.knn_w, 1.0 / np.sqrt(self.knn_w)
+        return None, None
+
+    @property
+    def variance(self) -> Optional[float]:
+        return self.estimate()[0]
+
+    @property
+    def variance_lcb(self) -> Optional[float]:
+        est, se = self.estimate()
+        return None if est is None else max(est - self.z * se, 0.0)
+
+    def state_dict(self) -> Dict:
+        return {k: getattr(self, k) for k in ["dof", "ss", "ss_var", "knn_w", "knn_s"]}
+
+    def load_state_dict(self, state: Dict) -> None:
+        for k, v in state.items():
+            setattr(self, k, v)

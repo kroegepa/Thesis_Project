@@ -337,7 +337,8 @@ The reward model learns captures abruptly after ~9–11 iterations regardless.
 **Limitations / open points:**
 - **σ must be known** (sensor spec, or the paper's "known noise family"). Estimating σ
   from data is only safe when some agents are persistently equal. Overestimating σ
-  leads to false certifications.
+  leads to false certifications. *Update: §3.4.4 removes this under homoscedastic noise
+  and locally deterministic rewards.*
 - **ε is an erasure budget.** The RMS guarantee allows erasing very rare events
   (p·Δ² ≤ ε²); this caused the early two-batch leak in Pursuit at σ=2.5. A relative
   tolerance (ε² as a fraction of the noise-corrected within-step reward variance) would
@@ -491,6 +492,90 @@ Metrics are pooled over the 20-iteration stream unless noted.
 - In the exploration harness, a clean warm start appeared useless. That was an
   architecture artefact: encoding o and o′ separately learns events much worse than
   stacking them as channels, which the package does.
+
+#### 3.4.4 σ-free certification under homoscedastic noise (now the default)
+
+**Question.** Can certification work without knowing σ if σ is the same for every agent?
+
+**Homoscedasticity alone is not enough.** Write the true reward as r + η, with η white,
+zero-mean and idiosyncratic of variance v, and use noise variance σ² − v. This gives
+exactly the same observed rewards. So the noise variance is only identified up to
+unexplained one-step reward variation, which is the limitation of §3.4.1.
+
+**Adding one assumption makes it identifiable:** the true reward is a deterministic
+function of the agent's local transition (o, a, o'). Equal transitions then have equal
+true rewards, and their noisy rewards differ only by noise (theory notes A7, Prop. 8):
+- **Exact replicates (grid worlds).** The ANOVA pure error over identical (o, a, o') is
+  unbiased for σ², for any noise shape. In Pursuit, ~10⁴ of 48k samples per iteration are
+  replicated. The true reward's within-class variance is ~10⁻⁶ (deterministic, as
+  assumed). The estimate is unbiased: −0.3% ± 1.0% per batch.
+- **Near replicates (continuous observations).** Take k = 5 nearest neighbours in
+  standardised (o, a, o') space, regress (r̃_q − r̃_nn)²/2 on the squared distance, and use
+  the intercept (Tong & Wang 2005). In SimpleSpread the bias is −0.5% on average, with an
+  empirical sd of 2.3% per batch using 16k queries. The reported SE (2.8%) is slightly
+  conservative.
+
+**Two design points carried the result:**
+- **Pool without forgetting.** The noise kernel is stationary, so pool all iterations.
+- **Subtract the noise floor at query time.** The certifiers store raw squared
+  differences; 2σ̂² is subtracted when certifying, and its SE is added in quadrature to
+  the margin. An LCB shift instead (σ̂² − z·SE, then the pair margin on top) is too
+  conservative. The precision requirement is ε²/(2σ²) relative: 1% at σ = 3.5, ε = 0.5.
+- Bonus: the estimate does not come from temporal differences, so **certified temporal
+  merging is available σ-free**.
+
+**Results** (offline replay with the package `CertifiedGrouper`, same streams as §3.4.3;
+pooled over 20 iterations, iterations ≥ 13 in brackets):
+
+| setting | σ known | σ-free, replicates (new default) | σ-free, temporal estimator |
+|---|---|---|---|
+| Pursuit σ=3.5, within SNR, β | 0.16, β 0.97 (0.28) | 0.16, **β 0.96** (0.52) | 0.17, β 0.85 (0.51) |
+| Pursuit σ=3.5 + temporal window 5, within SNR | 0.16 (0.30) | 0.17 (**0.80**, β 0.91) | n/a |
+| Pursuit σ=3.5 + 2 clean batches + temporal 5, within SNR | **0.74** (0.87) | 0.18 (0.87) | n/a |
+| SimpleSpread σ=2.5, common SNR | 0.38 | **0.38** | 0.22 (β 0.77) |
+| SimpleSpread σ=2.5 + temporal 5 | 0.52 | **0.52** | n/a |
+| SimpleSpread σ=3.5 + temporal 5 | 0.34 | 0.37 | n/a |
+
+- **Replicates match known σ** in every setting without a warm start, keeping known-σ
+  credit retention (β 0.96 vs 0.97). The temporal estimator leaked credit
+  (β 0.85 in Pursuit, 0.77 in SimpleSpread).
+- In the late Pursuit iterations the replicate runs certify more consistently than the
+  known-σ run. The known-σ run sits right at the threshold (certified, lost, certified
+  again). σ̂² ends at +0.3% ± 0.4%, which loosens ε² by ~0.07. This is threshold
+  proximity, not a real advantage.
+- **Remaining gap: clean warm start.** With 2 clean batches, the proposal model is ready
+  at iteration 1, but σ̂² is not yet precise enough (SE 2–3% in the first iterations).
+  Certification starts at iteration 10 instead of 1, so the pooled SNR drops from 0.74 to
+  0.18; the late phase is identical. More replicate dof would close this. A coarser key
+  (o' only) gives ~5× more dof in the first iterations and is still deterministic in
+  Pursuit, but it is a stronger assumption. Measuring σ from paired clean/noisy rewards
+  during the warm-up is equivalent to knowing σ.
+- **Failure mode.** If the reward depends on something outside the local transition
+  (e.g. a hidden team bonus), σ̂² is inflated and certification becomes optimistic.
+  With roles tied to agent identity, `grouping_use_agent_id=True` keeps replicates
+  per agent.
+
+**Stress tests (assumption violations)**, SimpleSpread σ=2.5:
+
+| violation | σ̂² / σ² | known σ (common SNR / within, β) | replicates |
+|---|---|---|---|
+| per-agent noise levels σᵢ = uᵢσ, uᵢ ∈ [0.55, 1.18] (not homoscedastic) | 0.62 (true agent mean 0.63) | 0.47 | 0.47 (same decisions) |
+| hidden team offset +1 for half the agents (not locally deterministic) | 1.01–1.02 (inflated) | 0.24 / 0.36, β 0.98 | 0.29 / 0.43, β 0.98 |
+
+- **Heteroscedastic noise.** Under per-agent noise levels the estimator returns the
+  agent-average σ². That is the right floor on average over merged pairs, as long as merges
+  do not favour particular agents. (The "known" column uses the nominal σ here, which
+  overstates the average.)
+- **Hidden offset.** It inflates σ̂² by only ~1–2%, because most nearest neighbours come
+  from the same team. Identity clusters still keep teams apart (β 0.98). The leak would
+  be larger with exact replicates across teams. That is the case where
+  `grouping_use_agent_id=True` (per-agent replicate classes) matters.
+
+**Recommendation for the paper.** Replace "σ known" by: "noise homoscedastic across
+agents, and the reward a deterministic function of the local transition", with the
+replicate estimator. Known σ remains an option (sensor spec), and the temporal
+estimator a fallback for heteroscedastic noise. This also directly answers the
+reviewers' "requires knowledge of the noise" concern.
 
 ---
 

@@ -31,6 +31,7 @@ from benchmarl.reward_robustness.metrics import (
 from benchmarl.reward_robustness.certification import (
     IdentityStructure,
     NoiseVarianceEstimator,
+    ReplicateNoiseEstimator,
     RuleCertifier,
     temporal_average,
     temporal_neighbours,
@@ -372,14 +373,29 @@ class TestCertifiedGrouper:
         truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
         assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.95
 
-    def test_noise_free_mode_runs_and_is_safe(self):
-        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True)
+    @pytest.mark.parametrize("estimator", ["replicates", "temporal"])
+    def test_noise_free_mode_runs_and_is_safe(self, estimator):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_estimator=estimator)
         grouper, hist = self._run(cfg)
         for data, assignment, _ in hist:
             if assignment.labels is not None:
                 truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
                 assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.9
         assert grouper.noise.variance is not None
+        if estimator == "replicates":  # discrete observations: exact replicates, sigma = 1
+            assert grouper.replicates.source == "replicates"
+            assert abs(grouper.replicates.variance - 1.0) < 0.05
+            off_before = grouper.rules["pred"].offset  # synced from the batches before the last one
+            grouper._sync_noise_offsets()
+            est, se = grouper.replicates.estimate()
+            assert grouper.rules["pred"].offset == pytest.approx(2 * est) and se > 0
+            assert off_before == pytest.approx(2 * est, rel=0.05)
+            data, assignment, logs = hist[-1]
+            assert logs["grouper/certified_rule"] > 0  # certifies without knowing sigma
+
+    def test_unknown_noise_estimator(self):
+        with pytest.raises(ValueError):
+            make_grouper(GroupingConfig(method="certified", certify_noise_estimator="magic"), self.spec)
 
     def test_state_dict_roundtrip(self):
         cfg = GroupingConfig(method="certified", epochs=1, certify_noise_std=1.0)
@@ -450,7 +466,63 @@ class TestCertifiedExtensions:
                 assert err < ((data.reward - data.true_reward) ** 2).mean()
         assert replaced >= 2  # warm-started model -> certified early
 
-    def test_temporal_needs_known_noise(self):
+    def test_temporal_needs_non_temporal_noise_estimate(self):
         with pytest.warns(UserWarning):
-            g = make_grouper(GroupingConfig(method="certified", certify_temporal_window=5), self.spec)
+            g = make_grouper(
+                GroupingConfig(method="certified", certify_temporal_window=5, certify_noise_estimator="temporal"),
+                self.spec,
+            )
         assert g.half_window == 0
+        g = make_grouper(GroupingConfig(method="certified", certify_temporal_window=5), self.spec)
+        assert g.half_window == 2  # replicate-based estimate (default) allows temporal merging
+
+
+class TestReplicateNoiseEstimator:
+    @staticmethod
+    def _discrete(n=20000, sigma=2.0, seed=0, event_rate=0.02):
+        """Grid-like transitions from a small set; rare large deterministic reward events."""
+        g = torch.Generator().manual_seed(seed)
+        state = torch.randint(0, 40, (n,), generator=g)
+        obs = torch.nn.functional.one_hot(state, 40).float()
+        nxt = torch.nn.functional.one_hot((state + torch.randint(0, 3, (n,), generator=g)) % 40, 40).float()
+        action = torch.nn.functional.one_hot(torch.randint(0, 5, (n,), generator=g), 5).float()
+        true = torch.where(state < int(40 * event_rate) + 1, 8.0, -0.1) + 0.3 * nxt.argmax(-1) / 40
+        noisy = true + sigma * torch.randn(n, generator=g)
+        return obs, nxt, action, true, noisy
+
+    def test_exact_replicates_unbiased_despite_rare_events(self):
+        sigma = 2.0
+        obs, nxt, action, true, noisy = self._discrete(sigma=sigma)
+        mask = torch.ones_like(noisy, dtype=torch.bool)
+        est = ReplicateNoiseEstimator()
+        est.update(obs, nxt, action, noisy, mask)
+        assert est.source == "replicates"
+        assert abs(est.variance / sigma ** 2 - 1) < 0.04
+        assert est.variance_lcb < est.variance
+        # the temporal-difference estimate is inflated by the reward events (reward varies along time)
+        temporal = NoiseVarianceEstimator()
+        temporal.update(noisy.reshape(1, -1, 1), mask.reshape(1, -1, 1))
+        assert temporal.variance.item() > 1.2 * sigma ** 2
+
+    def test_near_replicates_for_continuous_transitions(self):
+        sigma = 1.0
+        g = torch.Generator().manual_seed(1)
+        n = 8000
+        obs = torch.rand(n, 3, generator=g)
+        nxt = obs + 0.05 * torch.randn(n, 3, generator=g)
+        action = torch.rand(n, 1, generator=g)
+        true = torch.sin(3 * obs[:, 0]) + nxt[:, 1] - action[:, 0]
+        est = ReplicateNoiseEstimator()
+        for _ in range(3):  # pooled over batches
+            noisy = true + sigma * torch.randn(n, generator=g)
+            est.update(obs, nxt, action, noisy, torch.ones(n, dtype=torch.bool))
+        assert est.source == "near_replicates"
+        assert abs(est.variance / sigma ** 2 - 1) < 0.1
+
+    def test_state_dict_roundtrip(self):
+        obs, nxt, action, _, noisy = self._discrete(n=3000)
+        est = ReplicateNoiseEstimator()
+        est.update(obs, nxt, action, noisy, torch.ones_like(noisy, dtype=torch.bool))
+        est2 = ReplicateNoiseEstimator()
+        est2.load_state_dict(est.state_dict())
+        assert est2.variance == est.variance and est2.source == est.source

@@ -116,11 +116,16 @@ reward_model_min_skill_z: 3.0
 certify_z: 1.0
 # Memory of the certification statistics (per-iteration decay)
 certify_decay: 0.5
-# Known noise std of the reward perturbation. null: noise-variance-free mode (per-agent variances
-# estimated from residual temporal differences, identity clusters from lag-1 statistics). To use the
-# configured perturbation: experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'
+# Known noise std of the reward perturbation, or null to estimate it (certify_noise_estimator).
+# To use the configured perturbation: experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'
 certify_noise_std: null
-# In noise-variance-free mode, also require the reward model to beat a constant out of sample
+# How to estimate the noise when certify_noise_std is null:
+#   replicates  common variance (same for all agents) from replicated transitions: identical (o, a, o')
+#               (pure error) or nearest neighbours extrapolated to distance 0; assumes the true reward is a
+#               deterministic function of the local transition. Allows temporal merging.
+#   temporal    per agent from temporal differences of reward-model residuals (+ skill gate, lag-1 identity)
+certify_noise_estimator: "replicates"
+# With certify_noise_estimator=temporal, also require the reward model to beat a constant out of sample
 # (reward_model_min_skill_z); guards against not-yet-learned single-step reward events
 certify_skill_gate: True
 # Inverse-variance weighted group means (weights 1/s_j^2): best unbiased group estimate when agents'
@@ -128,7 +133,7 @@ certify_skill_gate: True
 certify_ivw: False
 # Also average each agent's corrected reward over its own neighbouring steps (odd window, e.g. 5;
 # 0 = off), only where predicted rewards are epsilon-close and the temporal rule is certified.
-# Requires certify_noise_std (known noise). Large gains for persistent rewards (navigation/coverage)
+# Requires a known noise std or certify_noise_estimator=replicates. Large gains for persistent rewards
 certify_temporal_window: 0
 # Fit the proposal reward model on clean rewards during a short warm-up (warmup_iters iterations, e.g. 2)
 certify_warmup: False

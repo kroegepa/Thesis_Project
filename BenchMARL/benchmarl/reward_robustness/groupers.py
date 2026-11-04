@@ -78,6 +78,7 @@ class GroupingConfig:
     certify_z: float = 1.0
     certify_decay: float = 0.5
     certify_noise_std: Optional[float] = None
+    certify_noise_estimator: str = "replicates"
     certify_skill_gate: bool = True
     certify_temporal_window: int = 0
     certify_ivw: bool = False
@@ -486,19 +487,26 @@ class CertifiedGrouper(RewardModelGrouper):
     3. Identity clusters can only *restrict* merges: they are blind to rare, short-lived
        reward events, which at high noise are invisible in reward statistics.
 
-    Noise variances ``s_i^2``: ``certify_noise_std`` if given (known noise), otherwise
-    estimated per agent from temporal differences of the model residuals, and identity
-    clusters use lag-1 statistics that need no noise variance. In that mode the
-    noise-free skill test of the reward model (``reward_model_min_skill_z``) must also pass
-    (``certify_skill_gate``), because unexplained single-step reward events inflate the
-    variance estimate (see :mod:`benchmarl.reward_robustness.certification`).
+    Noise variances ``s_i^2``:
+
+    * ``certify_noise_std`` given: known noise.
+    * ``certify_noise_estimator="replicates"`` (default when unknown): one common variance
+      (homoscedastic noise), estimated from replicated transitions, i.e. identical (o, a, o')
+      (pure error) or nearest neighbours extrapolated to distance 0. This assumes the true
+      reward is a deterministic function of the local transition. The certifiers accumulate
+      raw squared differences; the noise floor 2 sigma^2 is subtracted when certifying, with
+      the latest pooled estimate, and its standard error is added to the margin.
+    * ``certify_noise_estimator="temporal"``: per agent from temporal differences of the model
+      residuals, with lag-1 identity statistics. Unexplained single-step reward events
+      inflate this estimate, so the noise-free skill test (``reward_model_min_skill_z``,
+      ``certify_skill_gate``) must also pass.
 
     Options:
 
     * ``certify_ivw``: inverse-variance weighted group means (weights 1/s_j^2), the best
       linear unbiased group estimate when noise levels differ between agents. Weights use the
       per-agent variance estimates from earlier batches (also with a known common noise std).
-    * ``certify_temporal_window`` (odd w >= 3, known noise only): additionally average each
+    * ``certify_temporal_window`` (odd w >= 3; known noise or replicate estimate): additionally average each
       agent's corrected reward over its own +-w//2 neighbouring steps in the same episode
       whose predicted rewards are epsilon-close. The temporal rule is certified the same
       way, from ``(r~_{i,t+k} - r~_{i,t})^2 - 2 s_i^2`` over merged pairs.
@@ -514,26 +522,29 @@ class CertifiedGrouper(RewardModelGrouper):
         from benchmarl.reward_robustness.certification import (
             IdentityStructure,
             NoiseVarianceEstimator,
+            ReplicateNoiseEstimator,
             RuleCertifier,
+            TemporalCertifier,
         )
 
         self.rules = {
             r: RuleCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay) for r in self.RULES
         }
-        from benchmarl.reward_robustness.certification import TemporalCertifier
-
+        if cfg.certify_noise_estimator not in ("replicates", "temporal"):
+            raise ValueError(f"Unknown certify_noise_estimator '{cfg.certify_noise_estimator}'")
         self.identity = IdentityStructure(cfg.epsilon, z=cfg.certify_z)
-        self.noise = NoiseVarianceEstimator()
+        self.noise = NoiseVarianceEstimator()  # per agent, from residual temporal differences
+        self.replicates = ReplicateNoiseEstimator(z=cfg.certify_z)  # common sigma^2, replicated transitions
         self.temporal = TemporalCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay)
         self.active_rule = "-"
         self.temporal_active = False
-        if cfg.certify_temporal_window >= 3 and cfg.certify_noise_std is None:
+        if cfg.certify_temporal_window >= 3 and self._noise_source == "temporal":
             import warnings
 
             warnings.warn(
-                "certify_temporal_window needs a known noise std (certify_noise_std): a noise "
-                "variance estimated from temporal differences would make the temporal test vacuous. "
-                "Temporal merging is disabled."
+                "certify_temporal_window needs a known noise std or certify_noise_estimator="
+                "'replicates': a noise variance estimated from temporal differences would make the "
+                "temporal test vacuous. Temporal merging is disabled."
             )
 
     @property
@@ -550,16 +561,40 @@ class CertifiedGrouper(RewardModelGrouper):
     @property
     def half_window(self) -> int:
         w = self.cfg.certify_temporal_window
-        return w // 2 if (w >= 3 and self.known_noise) else 0
+        return w // 2 if (w >= 3 and self._noise_source != "temporal") else 0
 
     @property
     def known_noise(self) -> bool:
         return self.cfg.certify_noise_std is not None
 
+    @property
+    def _noise_source(self) -> str:
+        return "known" if self.known_noise else self.cfg.certify_noise_estimator
+
     def noise_variance(self, n_agents: int) -> Optional[torch.Tensor]:
-        if self.known_noise:
+        """Per-agent noise variances (known, or the current estimate; None before any)."""
+        source = self._noise_source
+        if source == "known":
             return torch.full((n_agents,), float(self.cfg.certify_noise_std) ** 2)
+        if source == "replicates":
+            v = self.replicates.variance
+            return None if v is None else torch.full((n_agents,), float(v))
         return self.noise.variance
+
+    def _update_noise_var(self, n_agents: int) -> Optional[torch.Tensor]:
+        """Noise variance subtracted inside the certifier updates. With the replicate estimate the
+        certifiers keep raw squared differences and subtract the noise at query time instead."""
+        if self._noise_source == "replicates":
+            return torch.zeros(n_agents)
+        return self.noise_variance(n_agents)
+
+    def _sync_noise_offsets(self) -> None:
+        if self._noise_source != "replicates":
+            return
+        est, se = self.replicates.estimate()
+        offset, offset_se = (0.0, 0.0) if est is None else (2.0 * est, 2.0 * se)
+        for cert in [*self.rules.values(), self.temporal]:
+            cert.set_noise_offset(offset, offset_se)
 
     def proposals(self, pred: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         props = {"pred": epsilon_labels(pred, self.cfg.epsilon, mask=mask)}
@@ -580,7 +615,9 @@ class CertifiedGrouper(RewardModelGrouper):
         return same.float().sum(-1).mean().item()
 
     def _select(self, props: Dict[str, torch.Tensor]) -> Tuple[str, Assignment]:
-        allowed = self.known_noise or not self.cfg.certify_skill_gate or self.skilled
+        # the skill gate guards the temporal-difference noise estimate, which unexplained single-step
+        # reward events inflate; known noise and replicate-based estimates do not need it
+        allowed = self._noise_source != "temporal" or not self.cfg.certify_skill_gate or self.skilled
         cands = [(r, lab) for r, lab in props.items() if allowed and self.rules[r].certified]
         if not cands:
             return "-", Assignment()
@@ -590,6 +627,7 @@ class CertifiedGrouper(RewardModelGrouper):
     def assign(self, data: GroupData) -> Assignment:
         if self.n_updates == 0:
             return Assignment()
+        self._sync_noise_offsets()
         return self._select(self.proposals(self.predict_rewards(data), data.mask))[1]
 
     def _corrected(
@@ -626,6 +664,7 @@ class CertifiedGrouper(RewardModelGrouper):
         assignment, pred = Assignment(), None
         n_agents = data.reward.shape[-1]
         if self.n_updates > 0:
+            self._sync_noise_offsets()  # noise estimate from earlier batches only
             pred = self.predict_rewards(data)  # model fitted on earlier batches only
             props = self.proposals(pred, data.mask)
             self.active_rule, assignment = self._select(props)
@@ -641,18 +680,20 @@ class CertifiedGrouper(RewardModelGrouper):
             )
             if values is not None:
                 assignment = Assignment(labels=assignment.labels, replace=values)
-            if var is not None:  # certify the rules on this batch, for later batches
+            cert_var = self._update_noise_var(n_agents)
+            if cert_var is not None:  # certify the rules on this batch, for later batches
                 for r, lab in props.items():
-                    self.rules[r].update(lab, data.reward, var, data.mask)
+                    self.rules[r].update(lab, data.reward, cert_var, data.mask)
                 if neighbours is not None:
-                    self.temporal.update(data.reward, var, neighbours)
+                    self.temporal.update(data.reward, cert_var, neighbours)
             self.noise.update(data.reward - pred, data.mask, data.done)
-        self.identity.update(
-            data.reward,
-            data.mask,
-            data.done,
-            noise_var=self.noise_variance(n_agents) if self.known_noise else None,
-        )
+        source = self._noise_source
+        if source == "temporal":  # no noise variance: lag-1 statistics (blind to single-step events)
+            self.identity.update(data.reward, data.mask, data.done, noise_var=None)
+        elif self.noise_variance(n_agents) is not None:  # uncentred second moments
+            self.identity.update(data.reward, data.mask, data.done, noise_var=self.noise_variance(n_agents))
+        if source == "replicates":
+            self.replicates.update(data.obs, data.next_obs, data.action, data.reward, data.mask)
         logs.update(super().update(data, pred_out=pred))
         logs["grouper/certified_rule"] = float(["-", *self.RULES].index(self.active_rule))
         logs["grouper/identity_clusters"] = float(self.identity.n_clusters)
@@ -662,6 +703,11 @@ class CertifiedGrouper(RewardModelGrouper):
             logs[f"grouper/{r}_margin"] = margin
         if self.noise.variance is not None:
             logs["grouper/noise_var_mean"] = self.noise.variance.mean().item()
+        if self._noise_source == "replicates" and self.replicates.variance is not None:
+            est, se = self.replicates.estimate()
+            logs["grouper/noise_var_replicates"] = est
+            logs["grouper/noise_var_replicates_se"] = se
+            logs["grouper/noise_replicate_dof"] = self.replicates.dof
         if self.half_window:
             delta, margin = self.temporal.stats()
             logs["grouper/temporal_active"] = float(self.temporal_active)
@@ -677,6 +723,7 @@ class CertifiedGrouper(RewardModelGrouper):
                 identity=self.identity.state_dict(),
                 noise=self.noise.state_dict(),
                 temporal=self.temporal.state_dict(),
+                replicates=self.replicates.state_dict(),
             )
         return state
 
@@ -689,6 +736,9 @@ class CertifiedGrouper(RewardModelGrouper):
             self.noise.load_state_dict(state["noise"])
             if "temporal" in state:
                 self.temporal.load_state_dict(state["temporal"])
+            if "replicates" in state:
+                self.replicates.load_state_dict(state["replicates"])
+            self._sync_noise_offsets()
 
 
 class RewardModelOnlyGrouper(RewardModelGrouper):

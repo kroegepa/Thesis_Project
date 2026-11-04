@@ -15,7 +15,7 @@ Evaluation always uses the true environment rewards.
 | `perturbation.py` | Gaussian and Bernoulli reward kernels |
 | `consensus.py` | mean / median / trimmed-mean / soft (weighted) / residual consensus |
 | `clustering.py` | thresholds, sorted GMM, 1-D k-means, ε-gap clustering |
-| `certification.py` | statistics for certified consensus (rule certification, identity clusters, noise variances) |
+| `certification.py` | statistics for certified consensus (rule/temporal certification, identity clusters, noise-variance estimators) |
 | `models.py` | `TransitionNet`: `(o, a[, o']) -> logits or reward` (CNN or MLP) |
 | `groupers.py` | grouping methods (see below) |
 | `metrics.py` | permutation-invariant grouping metrics and reward-error diagnostics |
@@ -79,21 +79,39 @@ Noise variance:
 
 - `certify_noise_std=<std>`: known noise. To tie it to the simulated perturbation, use
   `experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'`.
-- `certify_noise_std=null` (default): noise-variance-free mode.
-  - Per-agent variances come from temporal differences of the model residuals.
-  - Identity clusters come from lag-1 statistics, which contain no noise term.
-  - The reward model must also beat a constant out of sample (`certify_skill_gate`).
-  - Limitation: single-step reward events the model has not yet learned are
-    indistinguishable from noise, so this mode certifies somewhat earlier than the
-    known-σ mode. In the offline tests it kept 0.77–0.85 of within-step credit in
-    Pursuit vs 0.95 with known σ.
+- `certify_noise_std=null` (default): σ is estimated (`certify_noise_estimator`).
+  - `replicates` (default) assumes **homoscedastic noise** (the same σ for every agent,
+    any distribution) and a true reward that is a **deterministic function of the local
+    transition** (o, a, o').
+    - Samples with identical transitions then differ only by noise. Their within-class
+      variance (ANOVA pure error) is unbiased for σ².
+    - With continuous observations, it falls back to nearest neighbours in standardised
+      (o, a, o') space and extrapolates their squared differences to distance 0
+      (Tong & Wang, 2005).
+    - The estimate is pooled over all iterations. The certifiers store raw squared
+      differences; the noise floor 2σ̂² is subtracted when certifying, and its SE is
+      added to the margin.
+    - Unlike the temporal estimator, rare one-step reward events do not inflate σ̂², and
+      temporal merging is available.
+    - Precision matters: certifying ε against a noise floor of 2σ² needs σ² to about
+      ε²/(2σ²) relative precision (1% at σ=3.5, ε=0.5). Pursuit has ~10⁴ exact
+      replicates per iteration.
+    - If rewards depend on something outside the local transition (e.g. a hidden team
+      offset), σ̂² is inflated and certification becomes optimistic. With roles, use
+      `grouping_use_agent_id=True` so replicates are per agent.
+  - `temporal`: per-agent variances from temporal differences of the model residuals,
+    identity clusters from lag-1 statistics, and the reward model must beat a constant
+    out of sample (`certify_skill_gate`). Single-step reward events that the model has
+    not yet learned are indistinguishable from noise, so this mode certifies somewhat
+    early. In the offline tests it kept 0.77–0.85 of within-step credit in Pursuit, vs
+    0.95 with known σ.
 
 Extensions:
 
 - `certify_ivw=True`: inverse-variance weighted group means (weights 1/sᵢ²), the best
   linear unbiased estimate when agents' noise levels differ. Weights use per-agent
   estimates from earlier batches, so the mean stays unbiased.
-- `certify_temporal_window=5` (known noise std only): also average each agent's corrected
+- `certify_temporal_window=5` (known σ or `replicates`): also average each agent's corrected
   reward over its own neighbouring steps (same episode) whose predicted rewards are
   ε-close. The temporal rule is certified like the spatial one, from
   (r̃_{i,t+k} − r̃_{i,t})² − 2sᵢ². This gives large gains for persistent rewards, and is
@@ -106,6 +124,11 @@ correction 0.14, spatial oracle 0.54): certified 0.16 → + 2 clean batches 0.43
 + 2 clean batches + temporal window 5 **0.74**. SimpleSpread σ=2.5 (shared-objective SNR;
 none 0.20, oracle 0.42): certified 0.38 → + temporal 0.52.
 
+σ-free with `replicates`: identical to known σ without a warm start. Pursuit 0.16 with
+β 0.96 (temporal estimator: β 0.85), and 0.80 after iteration 13 with temporal window 5.
+SimpleSpread 0.38, and 0.52 with temporal. With a clean warm start, certification waits
+for a precise σ̂² (iteration 10 instead of 1 in Pursuit at σ=3.5).
+
 Recommended: `grouping_use_next_obs=True grouping_epochs=1`. ε (`grouping_epsilon`) is the
 tolerance of Assumption 1 in reward units. It is also an "erasure budget": events with
 rate p and size Δ may be averaged away if p·Δ² ≤ ε².
@@ -113,7 +136,8 @@ rate p and size Δ may be averaged away if p·Δ² ≤ ε².
 Logged (`reward_robustness/grouper/*`):
 - `certified_rule` (0 none, 1 `pred`, 2 `pred_in_id`);
 - `pred_delta` / `pred_margin` (estimate and z·SE);
-- `identity_clusters`, `noise_var_mean`, `skill_z`.
+- `identity_clusters`, `noise_var_mean`, `skill_z`;
+- `noise_var_replicates` / `_se`, `noise_replicate_dof` (replicate estimator).
 
 ## Migrating from the old flags
 
