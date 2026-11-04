@@ -64,15 +64,22 @@ python benchmarl/run.py -m $COMMON \
   experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
   experiment.certify_noise_std=null experiment.certify_noise_estimator=replicates,temporal "${@:2}"
 
-# 2c) Certified consensus with extensions: temporal merging and IVW, with/without a 2-iteration clean
-#     warm-up of the proposal model; known noise std vs sigma-free (replicate estimator)
+# 2c) Certified consensus with extensions: temporal merging (window 9), replicate consensus and IVW,
+#     with/without a 2-iteration clean warm-up of the proposal model; known noise std vs sigma-free
+#     (replicate estimator). For grid worlds also try experiment.certify_replicate_key=next_obs.
 python benchmarl/run.py -m $COMMON \
   experiment.grouping_method=certified \
   experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
   'experiment.certify_noise_std=${experiment.reward_perturbation_stdev},null' \
-  experiment.certify_noise_estimator=replicates \
-  experiment.certify_temporal_window=5 experiment.certify_ivw=True \
+  experiment.certify_noise_estimator=replicates experiment.certify_replicate_consensus=True \
+  experiment.certify_temporal_window=9 experiment.certify_ivw=True \
   experiment.certify_warmup=False,True experiment.warmup_iters=2 "${@:2}"
+
+# 2d) Temporal window ablation (sigma-free)
+python benchmarl/run.py -m $COMMON \
+  experiment.grouping_method=certified \
+  experiment.grouping_use_next_obs=True experiment.grouping_epochs=1 \
+  experiment.certify_temporal_window=0,5,9,13 "${@:2}"
 
 # 3) Robust global aggregation baseline (Byzantine-style global median, Reviewer 3)
 python benchmarl/run.py -m $COMMON \

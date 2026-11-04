@@ -716,6 +716,13 @@ common SNR (SimpleSpread), pooled (iterations ≥ 13):
 
 Roles (two hidden teams, known σ): window 5 → 9 raises within SNR from 0.57 to 0.62 pooled,
 and from 1.10 to 1.42 late, at β 0.97 → 0.96.
+SimpleSpread σ=3.5 (σ-free): window 5 → 9 gives 0.37 → 0.38 pooled and 0.57 → 0.73 late.
+Under the Bernoulli kernel (Pursuit, median consensus), window 9 is no better than 5
+(0.16 pooled, 0.29 late): there the bottleneck is how slowly certification accumulates
+evidence under heavy tails.
+
+**Recommendation:** temporal window 9 as the default for the paper's runs (13 adds a
+little more, with diminishing returns and a first sign of credit loss, β 0.90).
 
 Credit retention is unchanged (β 0.90–0.94 late in Pursuit). For reference, the
 spatial oracle reaches 0.54 within SNR in Pursuit; the certified spatio-temporal pipeline

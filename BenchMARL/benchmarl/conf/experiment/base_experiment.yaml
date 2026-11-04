@@ -144,7 +144,8 @@ certify_skill_gate: True
 certify_ivw: False
 # Also average each agent's corrected reward over its own neighbouring steps (odd window, e.g. 5;
 # 0 = off), only where predicted rewards are epsilon-close and the temporal rule is certified.
-# Requires a known noise std or certify_noise_estimator=replicates. Large gains for persistent rewards
+# Requires a known noise std or certify_noise_estimator=replicates; 9 worked best offline (5 < 9 <~ 13).
+# Large gains for persistent rewards
 certify_temporal_window: 0
 # Fit the proposal reward model on clean rewards during a short warm-up (warmup_iters iterations, e.g. 2)
 certify_warmup: False

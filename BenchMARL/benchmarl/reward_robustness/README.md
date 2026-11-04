@@ -111,11 +111,13 @@ Extensions:
 - `certify_ivw=True`: inverse-variance weighted group means (weights 1/sᵢ²), the best
   linear unbiased estimate when agents' noise levels differ. Weights use per-agent
   estimates from earlier batches, so the mean stays unbiased.
-- `certify_temporal_window=5` (known σ or `replicates`): also average each agent's corrected
+- `certify_temporal_window=9` (known σ or `replicates`): also average each agent's corrected
   reward over its own neighbouring steps (same episode) whose predicted rewards are
   ε-close. The temporal rule is certified like the spatial one, from
   (r̃_{i,t+k} − r̃_{i,t})² − 2sᵢ². This gives large gains for persistent rewards, and is
-  rejected automatically for spiky ones until the model explains the spikes.
+  rejected automatically for spiky ones until the model explains the spikes. Wider windows
+  kept helping offline. Late-phase within SNR in Pursuit (σ-free): 0.80 (w=5) → 0.88
+  (w=9) → 0.92 (w=13). In SimpleSpread: 0.81 → 1.01 → 1.13. Use 9.
 - `certify_warmup=True warmup_iters=2`: fit the proposal model on a few clean iterations
   first. Certification then starts almost immediately.
 - `certify_replicate_consensus=True`: before the certified merges, average the noisy
@@ -145,7 +147,14 @@ none 0.20, oracle 0.42): certified 0.38 → + temporal 0.52.
 SimpleSpread 0.38, and 0.52 with temporal. With a clean warm start, certification waits
 for a precise σ̂² (iteration 10 instead of 1 in Pursuit at σ=3.5).
 
-Recommended: `grouping_use_next_obs=True grouping_epochs=1`. ε (`grouping_epsilon`) is the
+Recommended:
+- `grouping_method=certified grouping_use_next_obs=True grouping_epochs=1
+  certify_temporal_window=9` (σ-free by default);
+- add `certify_replicate_consensus=True` for discrete observations, and
+  `certify_warmup=True warmup_iters=2` if a few clean iterations are available;
+- keep `certify_decay=0.5`. Longer memory delays certification while the model improves.
+
+ ε (`grouping_epsilon`) is the
 tolerance of Assumption 1 in reward units. It is also an "erasure budget": events with
 rate p and size Δ may be averaged away if p·Δ² ≤ ε².
 
