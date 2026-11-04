@@ -369,6 +369,40 @@ class TemporalCertifier:
         self.n, self.s, self.ss = state["n"], state["s"], state["ss"]
 
 
+REPLICATE_KEYS = ("transition", "next_obs")
+
+
+def transition_features(obs, next_obs, action, mask, key: str = "transition") -> torch.Tensor:
+    """``[n_alive, D]`` replicate key per alive sample: the local transition (o, a, o')
+    (``key="transition"``) or only the next observation o' (``key="next_obs"``, which assumes the
+    reward is a function of o' alone: a stronger assumption that yields more replicates)."""
+    n = mask.numel()
+    if key == "transition":
+        f = torch.cat([obs.reshape(n, -1), next_obs.reshape(n, -1), action.reshape(n, -1)], 1)
+    elif key == "next_obs":
+        f = next_obs.reshape(n, -1)
+    else:
+        raise ValueError(f"Unknown replicate key '{key}', expected one of {REPLICATE_KEYS}")
+    return f.float()[mask.reshape(-1)]
+
+
+def replicate_consensus(obs, next_obs, action, reward, mask, key: str = "transition"):
+    """Replace every alive sample's reward by the mean noisy reward of all samples in the batch with
+    the same replicate key (any agent, any step). If the true reward is a deterministic function of
+    the key, this has zero bias, so it needs no certification and is available from the first
+    iteration. Returns ``(values, fraction of alive samples that have a replicate)``."""
+    f = transition_features(obs, next_obs, action, mask, key)
+    m = mask.reshape(-1)
+    out = reward.clone().reshape(-1)
+    if f.shape[0] == 0:
+        return out.reshape(reward.shape), 0.0
+    x = out[m]
+    _, inv, cnt = torch.unique(f, dim=0, return_inverse=True, return_counts=True)
+    sums = torch.zeros(cnt.numel(), dtype=x.dtype, device=x.device).index_add_(0, inv, x)
+    out[m] = (sums / cnt.to(x.dtype))[inv]
+    return out.reshape(reward.shape), (cnt[inv] > 1).float().mean().item()
+
+
 class ReplicateNoiseEstimator:
     """Common noise variance from (near-)replicated transitions, without knowing sigma.
 
@@ -395,19 +429,23 @@ class ReplicateNoiseEstimator:
 
     CHUNK = 2 ** 24  # max distance-matrix entries per block
 
-    def __init__(self, decay: float = 1.0, min_dof: float = 2000.0, k: int = 5, n_query: int = 16000, z: float = 1.0):
-        self.decay, self.min_dof, self.k, self.n_query, self.z = decay, min_dof, k, n_query, z
+    def __init__(
+        self,
+        decay: float = 1.0,
+        min_dof: float = 2000.0,
+        k: int = 5,
+        n_query: int = 16000,
+        z: float = 1.0,
+        key: str = "transition",
+    ):
+        if key not in REPLICATE_KEYS:
+            raise ValueError(f"Unknown replicate key '{key}', expected one of {REPLICATE_KEYS}")
+        self.decay, self.min_dof, self.k, self.n_query, self.z, self.key = decay, min_dof, k, n_query, z, key
         self.dof = self.ss = self.ss_var = 0.0  # exact replicates: pooled dof, SS, var of SS
         self.knn_w = self.knn_s = 0.0  # near replicates: inverse-variance pooled intercepts
 
-    @staticmethod
-    def _features(obs, next_obs, action, mask):
-        n = mask.numel()
-        f = torch.cat([obs.reshape(n, -1), next_obs.reshape(n, -1), action.reshape(n, -1)], 1).float()
-        return f[mask.reshape(-1)]
-
     def update(self, obs, next_obs, action, reward, mask) -> None:
-        f = self._features(obs, next_obs, action, mask)
+        f = transition_features(obs, next_obs, action, mask, self.key)
         x = reward.reshape(-1)[mask.reshape(-1)].double()
         if x.numel() < 3:
             return

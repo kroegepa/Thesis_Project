@@ -577,6 +577,59 @@ replicate estimator. Known σ remains an option (sensor spec), and the temporal
 estimator a fallback for heteroscedastic noise. This also directly answers the
 reviewers' "requires knowledge of the noise" concern.
 
+#### 3.4.5 Developing the replicate idea, and other approaches considered
+
+**Where the replicates come from (Pursuit).** Almost all exact replicates are
+*different agents with identical transitions at the same step*: co-located pursuers
+taking the same action. The share of samples with a replicate grows with training
+(2% → 52%), as pursuers learn to move in packs. Measurements:
+
+| idea | measurement | verdict |
+|---|---|---|
+| cross-batch replicate table (tabular E[r̃ \| τ] over the whole history) | samples with a replicate: 0.41 within the batch vs 0.41 with history | no gain: transitions rarely recur across batches |
+| per-agent noise variances from within-agent replicates (drops homoscedasticity) | ~10 dof per agent after 6 batches | infeasible here |
+| model-free proposals: merge same-step agents with near-identical transitions | Hamming ≤ 2: zero true difference, but only 1–6% of pairs, mostly exact replicates; ≥ 13: 0.2–0.9 mean squared difference | nothing beyond exact replicates |
+| kNN transition consensus (continuous observations) | SimpleSpread: nearest transitions differ by 0.05–0.13 (squared) vs within-step credit variance 0.008 | smears credit like temporal merging; not pursued |
+| **replicate consensus** (average over identical transitions in the batch, zero bias, from iteration 0) | see below | small, free gain during the cold start |
+| **o′-only replicate key** (reward a function of o′) | Pursuit: true within-class variance ≤ 1e-3 (vs σ² = 12); ~2× the dof early | closes part of the warm-start gap |
+
+**Results** (Pursuit σ=3.5, σ-free replicates, offline replay; pooled within-step SNR,
+iterations ≥ 13 in brackets):
+
+| | no warm start | + temporal window 5 | + 2 clean batches + temporal 5 |
+|---|---|---|---|
+| transition key | 0.16 (0.52) | 0.17 (0.80) | 0.18 (0.87), certified from it. 10 |
+| + replicate consensus | 0.17 (0.52) | 0.18 (0.80) | 0.19 (0.87) |
+| o′ key | 0.16 (0.51) | – | **0.22** (0.87), certified from it. 6 |
+| o′ key + replicate consensus | – | **0.19** (0.73) | – |
+| *known σ, for reference* | *0.16 (0.28)* | *0.16 (0.30)* | *0.74 (0.87)* |
+
+- Replicate consensus removes 1–34% of the noise variance with the transition key, and
+  4–54% with the o′ key (events alike).
+  - Transition key: its RMS bias on true rewards is ≤ 0.001, so it is a safe, free
+    cold-start gain (+0.01–0.02 SNR).
+  - o′ key: the RMS bias reaches 0.08 (some captures are not determined by o′). That
+    costs a little once certified merges are active (0.80 → 0.73 late).
+- The o′ key gets σ̂² precise sooner. With a clean warm start, certification starts at
+  iteration 6 instead of 10. Known σ starts at 1, so the warm-start gap shrinks but
+  remains: certification at σ = 3.5 needs σ² to ~0.5%, i.e. ~50–80k replicate dof.
+- SimpleSpread (continuous observations): replicate consensus is a no-op (0.52 with
+  temporal window 5, as before).
+
+**Not tested, worth considering:**
+- **Critic-implied rewards as proposals.** V(s_t) − γV(s_{t+1}) from the MAPPO critic
+  needs no extra model. Testing it needs online runs.
+- **Symmetry-canonicalised replicates.** In grid worlds, transitions related by
+  rotations/reflections (with the action permuted accordingly) have equal rewards if the
+  task is isotropic. That gives up to 8× more replicates for σ̂², but it is a structural
+  assumption about the task.
+- **Deconvolution with discrete reward support.** If the true rewards take few values
+  (Pursuit: −0.1, +0.01, +5) and the noise is Gaussian, a tied-variance mixture
+  identifies σ without replicates. It depends on the noise shape.
+- **Relative tolerance (protect rare events).** With σ̂², the within-step true reward
+  variance is estimable, so ε² could be set to a fraction of it. Certification would
+  then need ~(1/κ)² more contrasts, which is too slow at σ = 3.5.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)

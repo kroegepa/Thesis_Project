@@ -86,6 +86,8 @@ class RewardRobustness:
             certify_decay=config.certify_decay,
             certify_noise_std=config.certify_noise_std,
             certify_noise_estimator=config.certify_noise_estimator,
+            certify_replicate_key=config.certify_replicate_key,
+            certify_replicate_consensus=config.certify_replicate_consensus,
             certify_skill_gate=config.certify_skill_gate,
             certify_temporal_window=config.certify_temporal_window,
             certify_ivw=config.certify_ivw,

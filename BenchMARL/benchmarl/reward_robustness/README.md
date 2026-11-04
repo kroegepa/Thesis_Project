@@ -118,6 +118,17 @@ Extensions:
   rejected automatically for spiky ones until the model explains the spikes.
 - `certify_warmup=True warmup_iters=2`: fit the proposal model on a few clean iterations
   first. Certification then starts almost immediately.
+- `certify_replicate_consensus=True`: before the certified merges, average the noisy
+  rewards of all samples in the batch (any agent, any step) with identical replicate keys.
+  Under local determinism this has zero bias, so it applies from the first iteration,
+  before anything is certified.
+  - Pursuit: mostly co-located pursuers taking the same action; it removes 1–34% of the
+    noise variance with the transition key, 4–54% with the o' key.
+  - No-op for continuous observations.
+- `certify_replicate_key=next_obs`: replicates on o' only. This assumes the reward is a
+  function of o', which is stronger, and gives ~2× more replicates early, so σ̂² is
+  precise sooner (Pursuit warm start: certified from iteration 6 instead of 10). In
+  Pursuit it is not exactly true (RMS consensus bias up to 0.08).
 
 Offline results (Pursuit σ=3.5, within-step SNR pooled over a 20-iteration stream; no
 correction 0.14, spatial oracle 0.54): certified 0.16 → + 2 clean batches 0.43 →

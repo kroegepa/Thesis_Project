@@ -79,6 +79,8 @@ class GroupingConfig:
     certify_decay: float = 0.5
     certify_noise_std: Optional[float] = None
     certify_noise_estimator: str = "replicates"
+    certify_replicate_key: str = "transition"
+    certify_replicate_consensus: bool = False
     certify_skill_gate: bool = True
     certify_temporal_window: int = 0
     certify_ivw: bool = False
@@ -503,6 +505,11 @@ class CertifiedGrouper(RewardModelGrouper):
 
     Options:
 
+    * ``certify_replicate_consensus``: first average the noisy rewards of all samples in the batch
+      with identical replicate keys (``certify_replicate_key``: the transition (o, a, o'), or o'
+      only). Under local determinism this has zero bias, so it is applied from the first
+      iteration, before anything is certified. Spatial and temporal merges then act on these
+      averages.
     * ``certify_ivw``: inverse-variance weighted group means (weights 1/s_j^2), the best
       linear unbiased group estimate when noise levels differ between agents. Weights use the
       per-agent variance estimates from earlier batches (also with a known common noise std).
@@ -534,7 +541,8 @@ class CertifiedGrouper(RewardModelGrouper):
             raise ValueError(f"Unknown certify_noise_estimator '{cfg.certify_noise_estimator}'")
         self.identity = IdentityStructure(cfg.epsilon, z=cfg.certify_z)
         self.noise = NoiseVarianceEstimator()  # per agent, from residual temporal differences
-        self.replicates = ReplicateNoiseEstimator(z=cfg.certify_z)  # common sigma^2, replicated transitions
+        # common sigma^2 from replicated transitions
+        self.replicates = ReplicateNoiseEstimator(z=cfg.certify_z, key=cfg.certify_replicate_key)
         self.temporal = TemporalCertifier(cfg.epsilon, z=cfg.certify_z, decay=cfg.certify_decay)
         self.active_rule = "-"
         self.temporal_active = False
@@ -631,9 +639,15 @@ class CertifiedGrouper(RewardModelGrouper):
         return self._select(self.proposals(self.predict_rewards(data), data.mask))[1]
 
     def _corrected(
-        self, data: GroupData, labels: Optional[torch.Tensor], var: Optional[torch.Tensor], neighbours
+        self,
+        data: GroupData,
+        labels: Optional[torch.Tensor],
+        var: Optional[torch.Tensor],
+        neighbours,
+        base: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Corrected rewards when IVW or temporal merging is active (else None: plain labels)."""
+        """Corrected rewards when replicate consensus, IVW or temporal merging is active (else None:
+        plain labels). ``base``: replicate-consensus rewards, used in place of the noisy rewards."""
         from benchmarl.reward_robustness.certification import temporal_average
         from benchmarl.reward_robustness.consensus import apply_consensus
 
@@ -643,26 +657,33 @@ class CertifiedGrouper(RewardModelGrouper):
             var = self.noise.variance
         use_ivw = self.cfg.certify_ivw and var is not None and labels is not None
         use_temporal = neighbours is not None
-        if not (use_ivw or use_temporal):
+        if not (use_ivw or use_temporal or base is not None):
             return None
+        x = data.reward if base is None else base
         if labels is None:
-            values = data.reward.clone()
+            values = x.clone()
         elif use_ivw:
             same = (labels.unsqueeze(-1) == labels.unsqueeze(-2)) & (labels >= 0).unsqueeze(-1)
-            weights = same.to(data.reward.dtype) * (1.0 / var.to(data.reward.device)).clamp(max=1e6)
-            values = apply_consensus(data.reward, Assignment(weights=weights), data.mask, method="mean")
+            weights = same.to(x.dtype) * (1.0 / var.to(x.device)).clamp(max=1e6)
+            values = apply_consensus(x, Assignment(weights=weights), data.mask, method="mean")
         else:
-            values = apply_consensus(data.reward, Assignment(labels=labels), data.mask, method=self.cfg.consensus)
+            values = apply_consensus(x, Assignment(labels=labels), data.mask, method=self.cfg.consensus)
         if use_temporal:
             values = temporal_average(values, neighbours)
         return values
 
     def __call__(self, data: GroupData) -> Tuple[Assignment, Dict[str, float]]:
-        from benchmarl.reward_robustness.certification import temporal_neighbours
+        from benchmarl.reward_robustness.certification import replicate_consensus, temporal_neighbours
 
         logs: Dict[str, float] = {}
-        assignment, pred = Assignment(), None
+        assignment, pred, base = Assignment(), None, None
         n_agents = data.reward.shape[-1]
+        if self.cfg.certify_replicate_consensus:  # zero bias under local determinism: no certification
+            base, frac = replicate_consensus(
+                data.obs, data.next_obs, data.action, data.reward, data.mask, self.cfg.certify_replicate_key
+            )
+            assignment = Assignment(replace=base)
+            logs["grouper/replicated_frac"] = frac
         if self.n_updates > 0:
             self._sync_noise_offsets()  # noise estimate from earlier batches only
             pred = self.predict_rewards(data)  # model fitted on earlier batches only
@@ -676,7 +697,7 @@ class CertifiedGrouper(RewardModelGrouper):
                 )
                 self.temporal_active = self.temporal.certified
             values = self._corrected(
-                data, assignment.labels, var, neighbours if self.temporal_active else None
+                data, assignment.labels, var, neighbours if self.temporal_active else None, base
             )
             if values is not None:
                 assignment = Assignment(labels=assignment.labels, replace=values)

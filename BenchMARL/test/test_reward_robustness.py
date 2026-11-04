@@ -31,6 +31,7 @@ from benchmarl.reward_robustness.metrics import (
 from benchmarl.reward_robustness.certification import (
     IdentityStructure,
     NoiseVarianceEstimator,
+    replicate_consensus,
     ReplicateNoiseEstimator,
     RuleCertifier,
     temporal_average,
@@ -393,6 +394,19 @@ class TestCertifiedGrouper:
             data, assignment, logs = hist[-1]
             assert logs["grouper/certified_rule"] > 0  # certifies without knowing sigma
 
+    def test_replicate_consensus_applies_from_first_iteration(self):
+        cfg = GroupingConfig(method="certified", epochs=1, use_next_obs=True, certify_replicate_consensus=True)
+        grouper = make_grouper(cfg, self.spec)
+        data = _fake_data_big(0)
+        assignment, logs = grouper(data)
+        assert assignment.replace is not None and logs["grouper/replicated_frac"] > 0.9
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        # fake data: reward is deterministic in the observation -> class means are unbiased and less noisy
+        assert ((corrected - data.true_reward) ** 2).mean() < 0.1 * ((data.reward - data.true_reward) ** 2).mean()
+        _, hist = self._run(cfg, n=4)
+        for d, a, _ in hist:
+            assert a.replace is not None
+
     def test_unknown_noise_estimator(self):
         with pytest.raises(ValueError):
             make_grouper(GroupingConfig(method="certified", certify_noise_estimator="magic"), self.spec)
@@ -518,6 +532,29 @@ class TestReplicateNoiseEstimator:
             est.update(obs, nxt, action, noisy, torch.ones(n, dtype=torch.bool))
         assert est.source == "near_replicates"
         assert abs(est.variance / sigma ** 2 - 1) < 0.1
+
+    def test_replicate_consensus_is_unbiased_class_mean(self):
+        obs = torch.zeros(1, 4, 3, 2)
+        obs[0, :, 2, 0] = 1.0  # agent 2 sees something different
+        action = torch.zeros(1, 4, 3, 2)
+        action[..., 0] = 1.0
+        reward = torch.arange(12.0).reshape(1, 4, 3)
+        mask = torch.ones(1, 4, 3, dtype=torch.bool)
+        mask[0, 0, 0] = False  # dead agents neither contribute nor change
+        out, frac = replicate_consensus(obs, obs.clone(), action, reward, mask)
+        same = reward[0, :, :2][mask[0, :, :2]].mean()  # agents 0, 1 at all steps share one transition
+        assert torch.allclose(out[0, :, :2][mask[0, :, :2]], same.expand(7))
+        assert out[0, 0, 0] == reward[0, 0, 0]
+        assert torch.allclose(out[0, :, 2], reward[0, :, 2].mean().expand(4))
+        assert frac == 1.0
+        # the next-observation key ignores o and a
+        action2 = action.clone()
+        action2[0, 1, 0] = torch.tensor([0.0, 1.0])
+        out2, _ = replicate_consensus(obs, obs.clone(), action2, reward, torch.ones_like(mask), key="next_obs")
+        out3, _ = replicate_consensus(obs, obs.clone(), action2, reward, torch.ones_like(mask))
+        assert out2[0, 1, 0] == out2[0, 2, 0] and out3[0, 1, 0] != out3[0, 2, 0]
+        with pytest.raises(ValueError):
+            replicate_consensus(obs, obs, action, reward, mask, key="magic")
 
     def test_state_dict_roundtrip(self):
         obs, nxt, action, _, noisy = self._discrete(n=3000)

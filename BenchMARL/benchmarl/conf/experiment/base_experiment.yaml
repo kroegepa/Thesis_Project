@@ -125,6 +125,13 @@ certify_noise_std: null
 #               deterministic function of the local transition. Allows temporal merging.
 #   temporal    per agent from temporal differences of reward-model residuals (+ skill gate, lag-1 identity)
 certify_noise_estimator: "replicates"
+# Replicate key: "transition" (o, a, o') or "next_obs" (o' only: assumes the reward is a function of o',
+# a stronger assumption that gives more replicates, hence a precise noise estimate sooner)
+certify_replicate_key: "transition"
+# Average the noisy rewards of all samples in a batch with identical replicate keys (any agent, any step)
+# before the certified merges. Zero bias if the reward is deterministic in the key, so it applies from the
+# first iteration. Helps in discrete-observation tasks (e.g. co-located Pursuit agents); no-op otherwise.
+certify_replicate_consensus: False
 # With certify_noise_estimator=temporal, also require the reward model to beat a constant out of sample
 # (reward_model_min_skill_z); guards against not-yet-learned single-step reward events
 certify_skill_gate: True

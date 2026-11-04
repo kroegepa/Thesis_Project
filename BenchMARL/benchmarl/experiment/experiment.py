@@ -109,6 +109,8 @@ class ExperimentConfig:
     certify_decay: float = MISSING
     certify_noise_std: Optional[float] = MISSING
     certify_noise_estimator: str = MISSING
+    certify_replicate_key: str = MISSING
+    certify_replicate_consensus: bool = MISSING
     certify_skill_gate: bool = MISSING
     certify_temporal_window: int = MISSING
     certify_ivw: bool = MISSING
