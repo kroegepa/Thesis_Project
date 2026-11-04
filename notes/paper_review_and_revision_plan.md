@@ -601,7 +601,7 @@ iterations ≥ 13 in brackets):
 | transition key | 0.16 (0.52) | 0.17 (0.80) | 0.18 (0.87), certified from it. 10 |
 | + replicate consensus | 0.17 (0.52) | 0.18 (0.80) | 0.19 (0.87) |
 | o′ key | 0.16 (0.51) | – | **0.22** (0.87), certified from it. 6 |
-| o′ key + replicate consensus | – | **0.19** (0.73) | – |
+| o′ key + replicate consensus | – | **0.19** (0.73) | **0.25** (0.93), certified from it. 6 |
 | *known σ, for reference* | *0.16 (0.28)* | *0.16 (0.30)* | *0.74 (0.87)* |
 
 - Replicate consensus removes 1–34% of the noise variance with the transition key, and
