@@ -694,6 +694,30 @@ mean-preserving, E[r̃] = 0.9·r). Offline, σ-free (replicates); within-step SN
   modification, but needs more data. Under heavy-tailed corruption, the paper's median
   consensus on *certified* groups is the right combination.
 
+#### 3.4.7 Tuning the certified pipeline: certifier memory and temporal window
+
+**Certifier memory** (`certify_decay`; statistics decay per iteration). Longer memory
+*hurts* while the model is still improving: old statistics come from worse models and
+keep blocking. Pursuit σ=3.5, no warm start: first certified iteration 13 (decay 0.5),
+15 (0.75), 17–18 (0.9); σ-free + temporal 5 late within SNR 0.80 → 0.29 → 0.22. Once the
+model is stable (warm start, or SimpleSpread), decay 0.75 gives exactly the 0.5 results.
+Keep 0.5. (decay 0.25: running.)
+
+**Temporal window** (`certify_temporal_window`). Wider windows keep helping; the
+temporal certifier still decides where merging is allowed. Within-step SNR (Pursuit) or
+common SNR (SimpleSpread), pooled (iterations ≥ 13):
+
+| setting | window 5 | window 9 |
+|---|---|---|
+| Pursuit, σ-free, no warm start | 0.17 (0.80) | 0.17 (**0.88**) |
+| Pursuit, known σ, 2 clean batches | 0.74 (0.87) | **0.84 (0.97)** |
+| Pursuit, σ-free, 2 clean batches, o′ key + replicate consensus | 0.25 (0.93) | 0.25 (**1.04**) |
+| SimpleSpread σ=2.5, σ-free | 0.52 (0.81) | 0.54 (**1.01**) |
+
+Credit retention is unchanged (β 0.91–0.94 late in Pursuit). For reference, the
+spatial oracle reaches 0.54 within SNR in Pursuit; the certified spatio-temporal pipeline
+is well above it once certified.
+
 ---
 
 ## 4. Revision plan (mapped to reviewer comments)
