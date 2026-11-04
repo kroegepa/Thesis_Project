@@ -616,6 +616,19 @@ iterations ≥ 13 in brackets):
 - SimpleSpread (continuous observations): replicate consensus is a no-op (0.52 with
   temporal window 5, as before).
 
+**Cold start of the proposal model is data-limited, not optimisation-limited.** Pursuit
+σ=3.5, known σ (isolates the model), first certified iteration / pooled within SNR:
+
+| baseline (1 epoch, lr 1e-3, width 128) | 3 epochs | 3 epochs, lr 3e-4 | width 512 | lr 3e-3 |
+|---|---|---|---|---|
+| 13 (intermittent) / 0.16 | 10 (intermittent) / 0.16 | 13 / 0.16 | 13 / 0.16 | never / 0.14 |
+
+Together with the earlier negatives (auxiliary dynamics loss, EMA, replay of all past
+data, §3.4), the model needs ~10 iterations of noisy capture data regardless of the
+optimiser. Shortening the cold start therefore needs *information* (a few clean
+batches, or more replicates), not tuning. Over a 250-iteration run, it is ~4% of
+training.
+
 **Not tested, worth considering:**
 - **Critic-implied rewards as proposals.** V(s_t) − γV(s_{t+1}) from the MAPPO critic
   needs no extra model. Testing it needs online runs.
