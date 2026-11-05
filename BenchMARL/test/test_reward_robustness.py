@@ -1,0 +1,580 @@
+#  Unit tests for benchmarl.reward_robustness (no environments needed).
+
+import pytest
+import torch
+
+from benchmarl.reward_robustness.clustering import (
+    epsilon_labels,
+    gmm_labels,
+    kmeans_1d_labels,
+    threshold_labels,
+)
+from benchmarl.reward_robustness.consensus import (
+    apply_consensus,
+    Assignment,
+    group_mean,
+    group_median,
+    group_trimmed_mean,
+)
+from benchmarl.reward_robustness.groupers import (
+    GroupData,
+    GroupingConfig,
+    make_grouper,
+    oracle_labels,
+)
+from benchmarl.reward_robustness.metrics import (
+    adjusted_rand_index,
+    event_contrast_sums,
+    pairwise_grouping_scores,
+    reward_error_metrics,
+)
+from benchmarl.reward_robustness.certification import (
+    IdentityStructure,
+    NoiseVarianceEstimator,
+    replicate_consensus,
+    ReplicateNoiseEstimator,
+    RuleCertifier,
+    temporal_average,
+    temporal_neighbours,
+    TemporalCertifier,
+)
+from benchmarl.reward_robustness.perturbation import perturb_rewards
+from benchmarl.reward_robustness.task_spec import get_task_spec
+
+
+class TestConsensus:
+    def test_group_mean(self):
+        r = torch.tensor([[1.0, 3.0, 10.0, 20.0, 7.0]])
+        labels = torch.tensor([[0, 0, 1, 1, -1]])
+        mask = torch.ones_like(labels, dtype=torch.bool)
+        out = group_mean(r, labels, mask)
+        assert torch.allclose(out, torch.tensor([[2.0, 2.0, 15.0, 15.0, 7.0]]))
+
+    def test_mask_excludes_dead_agents(self):
+        # Agent 1 is dead: it must neither contribute nor be modified.
+        r = torch.tensor([[1.0, 100.0, 3.0]])
+        labels = torch.tensor([[0, 0, 0]])
+        mask = torch.tensor([[True, False, True]])
+        out = group_mean(r, labels, mask)
+        assert torch.allclose(out, torch.tensor([[2.0, 100.0, 2.0]]))
+
+    def test_groups_are_per_timestep(self):
+        r = torch.tensor([[1.0, 3.0], [5.0, 9.0]])
+        labels = torch.zeros(2, 2, dtype=torch.long)
+        out = group_mean(r, labels, torch.ones(2, 2, dtype=torch.bool))
+        assert torch.allclose(out, torch.tensor([[2.0, 2.0], [7.0, 7.0]]))
+
+    def test_median_is_robust_to_outlier(self):
+        r = torch.tensor([[1.0, 1.2, 0.9, 10.0, -3.0]])
+        labels = torch.tensor([[0, 0, 0, 0, 1]])
+        out = group_median(r, labels, torch.ones_like(labels, dtype=torch.bool))
+        assert torch.allclose(out[0, :4], torch.full((4,), 1.0))
+        assert out[0, 4] == -3.0
+
+    def test_trimmed_mean(self):
+        r = torch.tensor([[0.0, 1.0, 2.0, 3.0, 100.0]])
+        labels = torch.zeros(1, 5, dtype=torch.long)
+        out = group_trimmed_mean(r, labels, torch.ones(1, 5, dtype=torch.bool), trim=0.2)
+        assert torch.allclose(out, torch.full((1, 5), 2.0))
+
+    def test_soft_weights_and_offset(self):
+        r = torch.tensor([[1.0, 3.0, 50.0]])
+        mask = torch.ones(1, 3, dtype=torch.bool)
+        w = torch.tensor([[[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]])
+        out = apply_consensus(r, Assignment(weights=w), mask)
+        assert torch.allclose(out, torch.tensor([[2.0, 2.0, 50.0]]))
+        # Residual consensus with a perfect baseline returns baseline + mean residual.
+        offset = torch.tensor([[0.0, 2.0, 49.0]])
+        labels = torch.zeros(1, 3, dtype=torch.long)
+        out = apply_consensus(r, Assignment(labels=labels, offset=offset), mask)
+        assert torch.allclose(out, offset + 1.0)
+
+    def test_replace_and_noop(self):
+        r = torch.tensor([[1.0, 2.0]])
+        mask = torch.ones(1, 2, dtype=torch.bool)
+        assert torch.equal(apply_consensus(r, Assignment(), mask), r)
+        rep = torch.tensor([[5.0, 6.0]])
+        assert torch.equal(apply_consensus(r, Assignment(replace=rep), mask), rep)
+
+    def test_inactive_agents_are_left_alone(self):
+        r = torch.tensor([[1.0, 3.0, 100.0]])
+        labels = torch.zeros(1, 3, dtype=torch.long)
+        active = torch.tensor([[True, True, False]])
+        out = apply_consensus(r, Assignment(labels=labels, active=active))
+        assert torch.allclose(out, torch.tensor([[2.0, 2.0, 100.0]]))
+        out = apply_consensus(r, Assignment(replace=torch.zeros(1, 3), active=active))
+        assert torch.allclose(out, torch.tensor([[0.0, 0.0, 100.0]]))
+
+    def test_oracle_mean_is_unbiased_and_reduces_variance(self):
+        torch.manual_seed(0)
+        n, a, sigma = 20000, 8, 2.0
+        true = torch.zeros(n, a)
+        true[:, :2] = 5.0  # two agents get a large reward, six get nothing
+        noisy = true + sigma * torch.randn(n, a)
+        labels = (true > 1).long()
+        out = group_mean(noisy, labels, torch.ones(n, a, dtype=torch.bool))
+        err = out - true
+        assert err.mean().abs() < 0.02  # Proposition 1
+        assert torch.allclose(err[:, :2].var(), torch.tensor(sigma**2 / 2), rtol=0.05)  # Cor. 1
+        assert torch.allclose(err[:, 2:].var(), torch.tensor(sigma**2 / 6), rtol=0.05)
+
+
+class TestClustering:
+    def test_threshold_semantics(self):
+        r = torch.tensor([-0.1, -0.099, 4.9, 2.0])
+        # Pursuit: r > -0.1 -> level >= 1, r > 2 -> level 2
+        assert threshold_labels(r, (-0.1, 2.0), right=False).tolist() == [0, 1, 2, 1]
+        # >= semantics
+        assert threshold_labels(torch.tensor([0.0, 0.8]), (0.0, 0.8), right=True).tolist() == [1, 2]
+
+    def test_gmm_sorted_labels(self):
+        torch.manual_seed(0)
+        x = torch.cat([torch.randn(300) * 0.1 + 5, torch.randn(300) * 0.1 - 5, torch.randn(300) * 0.1])
+        labels = gmm_labels(x, 3, sort_components=True)
+        assert labels[:300].unique().tolist() == [2]
+        assert labels[300:600].unique().tolist() == [0]
+        assert labels[600:].unique().tolist() == [1]
+
+    def test_kmeans_keeps_rare_cluster(self):
+        x = torch.cat([torch.full((990,), -0.1), torch.full((10,), 4.9)])
+        labels = kmeans_1d_labels(x, 3)
+        assert labels[:990].unique().numel() == 1
+        assert labels[990:].unique().tolist() == [int(labels.max())]
+
+    def test_epsilon_labels(self):
+        v = torch.tensor([[0.0, 0.05, 1.0, 1.02, 5.0]])
+        mask = torch.tensor([[True, True, True, True, False]])
+        labels = epsilon_labels(v, 0.1, mask)
+        assert labels[0, 0] == labels[0, 1] and labels[0, 2] == labels[0, 3]
+        assert labels[0, 0] != labels[0, 2] and labels[0, 4] == -1
+
+
+class TestMetrics:
+    def test_pairwise_scores_permutation_invariant(self):
+        true = torch.tensor([[0, 0, 1, 1]])
+        pred = torch.tensor([[2, 2, 0, 0]])  # same partition, different ids
+        s = pairwise_grouping_scores(true, pred)
+        assert s["pair_precision"] == 1.0 and s["pair_recall"] == 1.0
+        assert adjusted_rand_index(true, pred) == pytest.approx(1.0)
+
+    def test_pairwise_scores_global_grouping(self):
+        true = torch.tensor([[0, 0, 1, 1]])
+        pred = torch.zeros(1, 4, dtype=torch.long)
+        s = pairwise_grouping_scores(true, pred)
+        assert s["pair_recall"] == 1.0
+        assert s["pair_precision"] == pytest.approx(4 / 12)
+        assert s["mean_group_size"] == pytest.approx(4.0)
+
+    def test_event_contrast(self):
+        true = torch.tensor([[5.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+        event = true > 1
+        num, den, rows = event_contrast_sums(true, true, event)
+        assert rows == 1 and num / den == pytest.approx(1.0)
+        shared = group_mean(true, torch.zeros_like(true, dtype=torch.long), torch.ones_like(event))
+        num, den, _ = event_contrast_sums(true, shared, event)
+        assert num / den == pytest.approx(0.0)
+
+    def test_reward_error_levels(self):
+        true = torch.tensor([0.0, 0.0, 5.0])
+        corrected = torch.tensor([0.5, 0.5, 4.0])
+        m = reward_error_metrics(true, true, corrected, levels=torch.tensor([0, 0, 2]))
+        assert m["level2_bias"] == pytest.approx(-1.0)
+        assert m["level0_bias"] == pytest.approx(0.5)
+
+
+def _fake_pursuit_data(n_env=4, t=50, a=6, sigma=1.0, seed=0):
+    """Reward = 5 if an 'evader' cell is set in the observation, else -0.1."""
+    g = torch.Generator().manual_seed(seed)
+    obs = torch.zeros(n_env, t, a, 7, 7, 3)
+    event = torch.rand(n_env, t, a, generator=g) < 0.2
+    obs[..., 3, 3, 2] = event.float()
+    true = torch.where(event, 4.9, -0.1)
+    noisy = true + sigma * torch.randn(true.shape, generator=g)
+    action = torch.nn.functional.one_hot(torch.randint(0, 5, (n_env, t, a), generator=g), 5)
+    return GroupData(
+        obs=obs,
+        next_obs=obs.clone(),
+        action=action.float(),
+        reward=noisy,
+        mask=torch.ones_like(true, dtype=torch.bool),
+        true_reward=true,
+    )
+
+
+class TestGroupers:
+    spec = get_task_spec("pursuit")
+
+    def test_oracle_labels(self):
+        data = _fake_pursuit_data()
+        labels = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+        assert set(labels.unique().tolist()) == {0, 2}
+
+    def test_untrained_learned_grouper_is_noop(self):
+        data = _fake_pursuit_data()
+        grouper = make_grouper(GroupingConfig(method="reward_model", epochs=1), self.spec)
+        assignment, _ = grouper(data)  # out-of-sample: assigns before the first update
+        assert assignment.labels is None and assignment.weights is None
+        assert grouper.n_updates == 1
+
+    @pytest.mark.parametrize("assign", ["kmeans", "epsilon", "kernel", "global"])
+    def test_reward_model_grouper_learns_levels(self, assign):
+        torch.manual_seed(0)
+        cfg = GroupingConfig(method="reward_model", epochs=5, reward_model_assign=assign, epsilon=0.5)
+        grouper = make_grouper(cfg, self.spec)
+        for seed in range(3):
+            grouper(_fake_pursuit_data(seed=seed))
+        data = _fake_pursuit_data(seed=10)
+        assignment, _ = grouper(data)
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        noisy_mse = ((data.reward - data.true_reward) ** 2).mean()
+        corr_mse = ((corrected - data.true_reward) ** 2).mean()
+        if assign != "global":
+            assert corr_mse < 0.6 * noisy_mse
+            truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+            if assignment.labels is not None:
+                assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.9
+
+    def test_ensemble_reward_model_gates_on_confidence(self):
+        torch.manual_seed(0)
+        cfg = GroupingConfig(
+            method="reward_model", epochs=3, reward_model_heads=4, reward_model_assign="epsilon"
+        )
+        grouper = make_grouper(cfg, self.spec)
+        for seed in range(3):
+            _, logs = grouper(_fake_pursuit_data(seed=seed))
+        assert 0.0 <= logs["grouper/confident_frac"] <= 1.0
+        data = _fake_pursuit_data(seed=7)
+        assignment, _ = grouper(data)
+        assert assignment.active is not None and assignment.active.dtype == torch.bool
+        # Agents that are not confident are never grouped
+        assert (assignment.labels[~assignment.active] == -1).all()
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        assert torch.equal(corrected[~assignment.active], data.reward[~assignment.active])
+
+    def test_skill_gate_blocks_unskilled_model(self):
+        torch.manual_seed(0)
+        grouper = make_grouper(GroupingConfig(method="reward_model", epochs=2), self.spec)
+        for seed in range(3):
+            data = _fake_pursuit_data(seed=seed)
+            data.true_reward = torch.full_like(data.true_reward, -0.1)  # no learnable signal
+            data.reward = data.true_reward + torch.randn_like(data.reward)
+            assignment, logs = grouper(data)
+        assert logs["grouper/skill_z"] < 3.0 and not grouper.skilled
+        assert assignment.labels is None and assignment.weights is None  # falls back to no-op
+
+    def test_warmup_grouper(self):
+        torch.manual_seed(0)
+        grouper = make_grouper(GroupingConfig(method="warmup", epochs=40), self.spec)
+        assert grouper.needs_warmup
+        clean = _fake_pursuit_data(sigma=0.0)
+        grouper.warmup_update(clean)
+        data = _fake_pursuit_data(seed=3)
+        assignment, _ = grouper(data)
+        truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+        assert adjusted_rand_index(truth, assignment.labels) > 0.9
+
+    def test_state_dict_roundtrip(self):
+        cfg = GroupingConfig(method="reward_model", epochs=1)
+        g1 = make_grouper(cfg, self.spec)
+        g1(_fake_pursuit_data())
+        g1(_fake_pursuit_data(seed=1))  # second update computes the skill statistic
+        g2 = make_grouper(cfg, self.spec)
+        g2.load_state_dict(g1.state_dict())
+        data = _fake_pursuit_data(seed=5)
+        assert torch.allclose(g1.predict_rewards(data), g2.predict_rewards(data))
+        assert g2.skill_z == g1.skill_z and g2.n_updates == g1.n_updates
+
+
+def test_perturbation_kernels():
+    torch.manual_seed(0)
+    r = torch.zeros(100000)
+    noisy = perturb_rewards(r, "normal", stdev=2.0)
+    assert noisy.mean().abs() < 0.05 and abs(noisy.std().item() - 2.0) < 0.05
+    flipped = perturb_rewards(r, "bernoulli", flip_prob=0.1, outlier_value=10.0)
+    assert set(flipped.unique().tolist()) == {-10.0, 0.0, 10.0}
+    assert abs((flipped != 0).float().mean().item() - 0.1) < 0.01
+    with pytest.raises(ValueError):
+        perturb_rewards(r, "uniform")
+
+
+def _team_rewards(b=4, t=500, a=6, offset=2.0, sigma=1.0, seed=0):
+    """Two persistent teams (agents 0-2, 3-5); team 2 has a reward offset; rewards change slowly."""
+    g = torch.Generator().manual_seed(seed)
+    common = torch.randn(b, t // 50, 1, generator=g).repeat_interleave(50, dim=1)
+    true = common.expand(b, t, a).clone()
+    true[..., 3:] += offset
+    scales = torch.linspace(0.6, 1.4, a) * sigma
+    noisy = true + torch.randn(b, t, a, generator=g) * scales
+    return true, noisy, scales ** 2
+
+
+class TestCertification:
+    def test_rule_certifier(self):
+        true, noisy, var = _team_rewards()
+        good, bad = RuleCertifier(0.5), RuleCertifier(0.5)
+        labels_good = torch.tensor([0, 0, 0, 1, 1, 1]).expand_as(true)
+        good.update(labels_good, noisy, var)
+        bad.update(torch.zeros_like(labels_good), noisy, var)
+        assert abs(good.stats()[0]) < 0.1 and good.certified
+        assert bad.stats()[0] > 1.5 and not bad.certified  # 9 of 15 pairs differ by 2
+
+    @pytest.mark.parametrize("known_noise", [True, False])
+    def test_identity_structure_finds_teams(self, known_noise):
+        true, noisy, var = _team_rewards()
+        ident = IdentityStructure(0.5)
+        mask = torch.ones_like(true, dtype=torch.bool)
+        ident.update(noisy, mask, noise_var=var if known_noise else None)
+        lab = ident.labels
+        assert lab[0] == lab[1] == lab[2] and lab[3] == lab[4] == lab[5] and lab[0] != lab[3]
+
+    def test_identity_structure_no_false_merges_on_independent_rewards(self):
+        g = torch.Generator().manual_seed(1)
+        true = torch.randn(4, 500, 4, generator=g).repeat_interleave(1, dim=1) * 2
+        noisy = true + torch.randn(4, 500, 4, generator=g)
+        ident = IdentityStructure(0.5)
+        ident.update(noisy, torch.ones_like(noisy, dtype=torch.bool), noise_var=torch.ones(4))
+        assert ident.n_clusters == 4
+
+    def test_noise_variance_estimator(self):
+        true, noisy, var = _team_rewards(t=2000)
+        est = NoiseVarianceEstimator()
+        est.update(noisy, torch.ones_like(noisy, dtype=torch.bool))
+        assert torch.allclose(est.variance, var, rtol=0.15)
+
+
+def _fake_data_big(seed, sigma=1.0):
+    d = _fake_pursuit_data(n_env=8, t=100, a=6, sigma=0.0, seed=seed)
+    torch.manual_seed(seed + 100)
+    d.reward = d.true_reward + sigma * torch.randn_like(d.true_reward)
+    return d
+
+
+class TestCertifiedGrouper:
+    spec = get_task_spec("pursuit")
+
+    def _run(self, cfg, n=6):
+        torch.manual_seed(0)
+        grouper = make_grouper(cfg, self.spec)
+        history = []
+        for seed in range(n):
+            data = _fake_data_big(seed)
+            assignment, logs = grouper(data)
+            history.append((data, assignment, logs))
+        return grouper, history
+
+    def test_known_noise_certifies_and_corrects(self):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0)
+        grouper, hist = self._run(cfg)
+        first = hist[0][1]
+        assert first.labels is None  # nothing certified before any data
+        data, assignment, logs = hist[-1]
+        assert assignment.labels is not None and logs["grouper/certified_rule"] > 0
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        assert ((corrected - data.true_reward) ** 2).mean() < 0.6 * ((data.reward - data.true_reward) ** 2).mean()
+        truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+        assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.95
+
+    @pytest.mark.parametrize("estimator", ["replicates", "temporal"])
+    def test_noise_free_mode_runs_and_is_safe(self, estimator):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_estimator=estimator)
+        grouper, hist = self._run(cfg)
+        for data, assignment, _ in hist:
+            if assignment.labels is not None:
+                truth = oracle_labels(data.true_reward, self.spec, 3, data.mask)
+                assert pairwise_grouping_scores(truth, assignment.labels)["pair_precision"] > 0.9
+        assert grouper.noise.variance is not None
+        if estimator == "replicates":  # discrete observations: exact replicates, sigma = 1
+            assert grouper.replicates.source == "replicates"
+            assert abs(grouper.replicates.variance - 1.0) < 0.05
+            off_before = grouper.rules["pred"].offset  # synced from the batches before the last one
+            grouper._sync_noise_offsets()
+            est, se = grouper.replicates.estimate()
+            assert grouper.rules["pred"].offset == pytest.approx(2 * est) and se > 0
+            assert off_before == pytest.approx(2 * est, rel=0.05)
+            data, assignment, logs = hist[-1]
+            assert logs["grouper/certified_rule"] > 0  # certifies without knowing sigma
+
+    def test_replicate_consensus_applies_from_first_iteration(self):
+        cfg = GroupingConfig(method="certified", epochs=1, use_next_obs=True, certify_replicate_consensus=True)
+        grouper = make_grouper(cfg, self.spec)
+        data = _fake_data_big(0)
+        assignment, logs = grouper(data)
+        assert assignment.replace is not None and logs["grouper/replicated_frac"] > 0.9
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        # fake data: reward is deterministic in the observation -> class means are unbiased and less noisy
+        assert ((corrected - data.true_reward) ** 2).mean() < 0.1 * ((data.reward - data.true_reward) ** 2).mean()
+        _, hist = self._run(cfg, n=4)
+        for d, a, _ in hist:
+            assert a.replace is not None
+
+    def test_residual_rules_merge_whole_steps_once_the_model_is_good(self):
+        cfg = GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0, certify_residual=True)
+        grouper, hist = self._run(cfg, n=8)
+        assert set(grouper.rules) >= {"pred", "res_pred", "res_all"}
+        data, assignment, logs = hist[-1]
+        # fake data: the model learns the reward exactly, so equal model errors hold across all agents
+        assert grouper.active_rule == "res_all" and logs["grouper/residual_active"] == 1.0
+        corrected = apply_consensus(data.reward, assignment, data.mask)
+        err = ((corrected - data.true_reward) ** 2).mean()
+        assert err < 0.3 * ((data.reward - data.true_reward) ** 2).mean()
+        # plain rules on the same data merge only equal-reward agents: larger error
+        plain, hist_plain = self._run(GroupingConfig(method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0), n=8)
+        d2, a2, _ = hist_plain[-1]
+        assert err < ((apply_consensus(d2.reward, a2, d2.mask) - d2.true_reward) ** 2).mean()
+
+    def test_unknown_noise_estimator(self):
+        with pytest.raises(ValueError):
+            make_grouper(GroupingConfig(method="certified", certify_noise_estimator="magic"), self.spec)
+
+    def test_state_dict_roundtrip(self):
+        cfg = GroupingConfig(method="certified", epochs=1, certify_noise_std=1.0)
+        g1, _ = self._run(cfg, n=3)
+        g2 = make_grouper(cfg, self.spec)
+        g2.load_state_dict(g1.state_dict())
+        assert g2.rules["pred"].state_dict() == g1.rules["pred"].state_dict()
+        assert (g2.identity.labels == g1.identity.labels).all()
+        data = _fake_data_big(9)
+        assert torch.allclose(g1.predict_rewards(data), g2.predict_rewards(data))
+
+
+class TestTemporal:
+    def test_neighbours_respect_episodes_mask_and_vetting(self):
+        pred = torch.zeros(1, 6, 2)
+        pred[0, 3, 1] = 5.0  # agent 1: predicted event at t=3
+        mask = torch.ones(1, 6, 2, dtype=torch.bool)
+        done = torch.zeros(1, 6, dtype=torch.bool)
+        done[0, 2] = True  # episode ends after t=2
+        nb = temporal_neighbours(pred, mask, done, 1, epsilon=0.5)
+        assert nb[1][0, 1, 0] and not nb[1][0, 2, 0]  # (1,2) same episode, (2,3) crosses the boundary
+        assert not nb[1][0, 3, 1] and not nb[-1][0, 4, 1]  # vetting blocks the event step
+        assert torch.equal(nb[-1][0, 1:], nb[1][0, :-1])  # backward = shifted forward
+
+    def test_temporal_average(self):
+        v = torch.tensor([[[1.0], [2.0], [3.0], [10.0]]])
+        nb = temporal_neighbours(torch.zeros_like(v), torch.ones_like(v, dtype=torch.bool), None, 1, None)
+        out = temporal_average(v, nb)
+        assert torch.allclose(out[0, :, 0], torch.tensor([1.5, 2.0, 5.0, 6.5]))
+
+    def test_temporal_certifier(self):
+        g = torch.Generator().manual_seed(0)
+        smooth = torch.linspace(0, 1, 400).repeat(4, 1).unsqueeze(-1).expand(4, 400, 3)
+        spiky = (torch.rand(4, 400, 3, generator=g) < 0.05).float() * 5.0
+        var = torch.ones(3)
+        for true, expect in [(smooth, True), (spiky, False)]:
+            noisy = true + torch.randn(true.shape, generator=g)
+            nb = temporal_neighbours(torch.zeros_like(true), torch.ones_like(true, dtype=torch.bool), None, 2, None)
+            cert = TemporalCertifier(0.5)
+            cert.update(noisy, var, nb)
+            assert cert.certified == expect
+
+
+class TestCertifiedExtensions:
+    spec = get_task_spec("pursuit")
+
+    def test_temporal_ivw_and_warmup(self):
+        torch.manual_seed(0)
+        cfg = GroupingConfig(
+            method="certified", epochs=3, use_next_obs=True, certify_noise_std=1.0,
+            certify_temporal_window=3, certify_ivw=True, certify_warmup=True,
+        )
+        grouper = make_grouper(cfg, self.spec)
+        assert grouper.needs_warmup and grouper.half_window == 1
+        clean = _fake_data_big(0)
+        clean.reward = clean.true_reward.clone()
+        logs = grouper.warmup_update(clean)
+        assert logs["grouper/warmup_loss"] < 1.0
+        replaced = 0
+        for seed in range(1, 5):
+            data = _fake_data_big(seed)
+            assignment, logs = grouper(data)
+            assert "grouper/temporal_delta" in logs
+            if assignment.replace is not None:
+                replaced += 1
+                corrected = apply_consensus(data.reward, assignment, data.mask)
+                err = ((corrected - data.true_reward) ** 2).mean()
+                assert err < ((data.reward - data.true_reward) ** 2).mean()
+        assert replaced >= 2  # warm-started model -> certified early
+
+    def test_temporal_needs_non_temporal_noise_estimate(self):
+        with pytest.warns(UserWarning):
+            g = make_grouper(
+                GroupingConfig(method="certified", certify_temporal_window=5, certify_noise_estimator="temporal"),
+                self.spec,
+            )
+        assert g.half_window == 0
+        g = make_grouper(GroupingConfig(method="certified", certify_temporal_window=5), self.spec)
+        assert g.half_window == 2  # replicate-based estimate (default) allows temporal merging
+
+
+class TestReplicateNoiseEstimator:
+    @staticmethod
+    def _discrete(n=20000, sigma=2.0, seed=0, event_rate=0.02):
+        """Grid-like transitions from a small set; rare large deterministic reward events."""
+        g = torch.Generator().manual_seed(seed)
+        state = torch.randint(0, 40, (n,), generator=g)
+        obs = torch.nn.functional.one_hot(state, 40).float()
+        nxt = torch.nn.functional.one_hot((state + torch.randint(0, 3, (n,), generator=g)) % 40, 40).float()
+        action = torch.nn.functional.one_hot(torch.randint(0, 5, (n,), generator=g), 5).float()
+        true = torch.where(state < int(40 * event_rate) + 1, 8.0, -0.1) + 0.3 * nxt.argmax(-1) / 40
+        noisy = true + sigma * torch.randn(n, generator=g)
+        return obs, nxt, action, true, noisy
+
+    def test_exact_replicates_unbiased_despite_rare_events(self):
+        sigma = 2.0
+        obs, nxt, action, true, noisy = self._discrete(sigma=sigma)
+        mask = torch.ones_like(noisy, dtype=torch.bool)
+        est = ReplicateNoiseEstimator()
+        est.update(obs, nxt, action, noisy, mask)
+        assert est.source == "replicates"
+        assert abs(est.variance / sigma ** 2 - 1) < 0.04
+        assert est.variance_lcb < est.variance
+        # the temporal-difference estimate is inflated by the reward events (reward varies along time)
+        temporal = NoiseVarianceEstimator()
+        temporal.update(noisy.reshape(1, -1, 1), mask.reshape(1, -1, 1))
+        assert temporal.variance.item() > 1.2 * sigma ** 2
+
+    def test_near_replicates_for_continuous_transitions(self):
+        sigma = 1.0
+        g = torch.Generator().manual_seed(1)
+        n = 8000
+        obs = torch.rand(n, 3, generator=g)
+        nxt = obs + 0.05 * torch.randn(n, 3, generator=g)
+        action = torch.rand(n, 1, generator=g)
+        true = torch.sin(3 * obs[:, 0]) + nxt[:, 1] - action[:, 0]
+        est = ReplicateNoiseEstimator()
+        for _ in range(3):  # pooled over batches
+            noisy = true + sigma * torch.randn(n, generator=g)
+            est.update(obs, nxt, action, noisy, torch.ones(n, dtype=torch.bool))
+        assert est.source == "near_replicates"
+        assert abs(est.variance / sigma ** 2 - 1) < 0.1
+
+    def test_replicate_consensus_is_unbiased_class_mean(self):
+        obs = torch.zeros(1, 4, 3, 2)
+        obs[0, :, 2, 0] = 1.0  # agent 2 sees something different
+        action = torch.zeros(1, 4, 3, 2)
+        action[..., 0] = 1.0
+        reward = torch.arange(12.0).reshape(1, 4, 3)
+        mask = torch.ones(1, 4, 3, dtype=torch.bool)
+        mask[0, 0, 0] = False  # dead agents neither contribute nor change
+        out, frac = replicate_consensus(obs, obs.clone(), action, reward, mask)
+        same = reward[0, :, :2][mask[0, :, :2]].mean()  # agents 0, 1 at all steps share one transition
+        assert torch.allclose(out[0, :, :2][mask[0, :, :2]], same.expand(7))
+        assert out[0, 0, 0] == reward[0, 0, 0]
+        assert torch.allclose(out[0, :, 2], reward[0, :, 2].mean().expand(4))
+        assert frac == 1.0
+        # the next-observation key ignores o and a
+        action2 = action.clone()
+        action2[0, 1, 0] = torch.tensor([0.0, 1.0])
+        out2, _ = replicate_consensus(obs, obs.clone(), action2, reward, torch.ones_like(mask), key="next_obs")
+        out3, _ = replicate_consensus(obs, obs.clone(), action2, reward, torch.ones_like(mask))
+        assert out2[0, 1, 0] == out2[0, 2, 0] and out3[0, 1, 0] != out3[0, 2, 0]
+        with pytest.raises(ValueError):
+            replicate_consensus(obs, obs, action, reward, mask, key="magic")
+
+    def test_state_dict_roundtrip(self):
+        obs, nxt, action, _, noisy = self._discrete(n=3000)
+        est = ReplicateNoiseEstimator()
+        est.update(obs, nxt, action, noisy, torch.ones_like(noisy, dtype=torch.bool))
+        est2 = ReplicateNoiseEstimator()
+        est2.load_state_dict(est.state_dict())
+        assert est2.variance == est.variance and est2.source == est.source

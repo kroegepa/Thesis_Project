@@ -38,23 +38,117 @@ polyak_tau: 0.005
 # If soft_target_update is False, this is the frequency of the hard target updates in terms of n_optimizer_steps
 hard_target_update_frequency: 5
 
-# Wheter to include reward attack
+# ---------------------------------------------------------------------------
+# Reward perturbation (kernel K, applied independently to every agent's reward)
+# ---------------------------------------------------------------------------
+# Whether to perturb the training rewards (evaluation always uses true rewards)
 reward_perturbation: False
-# The reward attack type, options are: "normal", "bernoulli"
+# The perturbation kernel: "normal" (additive zero-mean Gaussian) or "bernoulli" (outliers)
 reward_perturbation_type: "normal"
-# The reward attack standard deviation, relevant for gaussian
+# Standard deviation of the "normal" kernel
 reward_perturbation_stdev: 0.5
-# The reward flip probability, relevant for bernoulli
+# Probability that a reward is replaced by an outlier ("bernoulli" kernel)
 reward_perturbation_flip_prob: 0.2
+# Outliers are +/- this value ("bernoulli" kernel)
+reward_perturbation_outlier_value: 10.0
 
-#Whether to include power of friendship(pfo) reward robustness mechanism
-pof_enable: False
-#Whether to use original reward for grouping
-oracle_grouping: False
-#Whether to evaluate the grouping
-evaluate_grouping: False
-#Number of groups
+# ---------------------------------------------------------------------------
+# Grouped-reward robustness (GR^2-MARL), see benchmarl/reward_robustness
+# ---------------------------------------------------------------------------
+# How agents are grouped for the consensus correction:
+#   none              no correction (No-Correction baseline)
+#   oracle            levels of the true reward (upper bound)
+#   global            all agents in a single group (ablation)
+#   warmup            classifier trained on oracle labels during a clean warm-up, then frozen
+#   gmm               classifier trained online on GMM clusters of the noisy rewards (paper No-Warmup)
+#   reward_model      warm-up free: regress noisy rewards on (o, a[, o']) and group agents with
+#                     similar predicted rewards (see reward_model_* below)
+#   reward_model_only baseline: replace rewards with the learned reward model
+#   certified         reward-model proposals used only once certified from the noisy data (see certify_*)
+grouping_method: "none"
+# Consensus function C: "mean", "median", "trimmed_mean" or "auto" (mean for "normal", median otherwise)
+consensus: "auto"
+# Fraction trimmed from each side by "trimmed_mean"
+consensus_trim: 0.2
+# Number of groups K (oracle levels, classifier outputs, k-means clusters)
 num_groups: 3
+# Log grouping quality and reward-error diagnostics (uses the true rewards, for analysis only)
+evaluate_grouping: False
+# Number of warm-up iterations on clean rewards (grouping_method=warmup, or certified with certify_warmup)
+warmup_iters: 50
+# Training of the grouping network, per iteration (per warm-up iteration for "warmup")
+grouping_epochs: 35
+grouping_lr: 0.001
+grouping_batch_size: 512
+# Also feed the next observation o' to the grouping network (rewards are R(s, a, s'))
+grouping_use_next_obs: False
+# Append a one-hot agent index to the grouping-network input (role-dependent rewards)
+grouping_use_agent_id: False
+# Compute the groups of an iteration with the parameters fitted on previous iterations only, so the
+# grouping does not depend on the current noise realisation. False reproduces the original No-Warmup.
+grouping_out_of_sample: True
+# Order GMM components by their mean so that labels are consistent across batches ("gmm").
+# False reproduces the original No-Warmup implementation.
+grouping_gmm_sort: True
+# Similarity tolerance epsilon (reward units) for reward_model_assign = "epsilon" / "kernel"
+grouping_epsilon: 0.5
+# Reward-model loss: "mse", "huber", "l1" or "auto" (mse for "normal", l1 otherwise)
+reward_model_loss: "auto"
+# How agents are grouped from predicted rewards: "kmeans" (num_groups clusters), "epsilon"
+# (per-timestep epsilon-gap clustering), "kernel" (soft weights with bandwidth epsilon) or "global"
+reward_model_assign: "kmeans"
+# Residual consensus: apply the consensus to r~ - f(o, a) and add f(o, a) back
+reward_model_residual: False
+# Number of bootstrapped heads of the reward model. With > 1 heads, agents whose predictive std
+# exceeds grouping_epsilon are not grouped (they keep their own reward), so an unsure model falls
+# back to no correction instead of merging agents with different rewards
+reward_model_heads: 1
+# Only correct rewards once the reward model beats a constant predictor out of sample (paired
+# z-test on the previous batch). Prevents an untrained model from degenerating into global
+# grouping, which erases the credit of rare reward events. 0 disables the gate
+reward_model_min_skill_z: 3.0
+# --- grouping_method=certified (certified consensus) ---
+# Reward-model proposals (merge agents with grouping_epsilon-close predicted rewards, optionally only
+# within persistent identity clusters) are used only once out-of-sample statistics certify that the
+# merged agents' mean squared reward difference is <= grouping_epsilon^2 (upper confidence bound).
+# Recommended: grouping_use_next_obs=True grouping_epochs=1.
+# Confidence of the certification, in standard errors (one-sided)
+certify_z: 1.0
+# Memory of the certification statistics (per-iteration decay)
+certify_decay: 0.5
+# Known noise std of the reward perturbation, or null to estimate it (certify_noise_estimator).
+# To use the configured perturbation: experiment.certify_noise_std='${experiment.reward_perturbation_stdev}'
+certify_noise_std: null
+# How to estimate the noise when certify_noise_std is null:
+#   replicates  common variance (same for all agents) from replicated transitions: identical (o, a, o')
+#               (pure error) or nearest neighbours extrapolated to distance 0; assumes the true reward is a
+#               deterministic function of the local transition. Allows temporal merging.
+#   temporal    per agent from temporal differences of reward-model residuals (+ skill gate, lag-1 identity)
+certify_noise_estimator: "replicates"
+# Replicate key: "transition" (o, a, o') or "next_obs" (o' only: assumes the reward is a function of o',
+# a stronger assumption that gives more replicates, hence a precise noise estimate sooner)
+certify_replicate_key: "transition"
+# Average the noisy rewards of all samples in a batch with identical replicate keys (any agent, any step)
+# before the certified merges. Zero bias if the reward is deterministic in the key, so it applies from the
+# first iteration. Helps in discrete-observation tasks (e.g. co-located Pursuit agents); no-op otherwise.
+certify_replicate_consensus: False
+# Also certify residual rules: consensus on r~ - f (reward-model prediction f added back), so merged agents need
+# equal model errors, not equal rewards. Once the model is good, whole steps can be merged (incl. rare events),
+# and temporal merging works through predicted spikes. Plain and residual rules compete; the largest certified wins.
+certify_residual: False
+# With certify_noise_estimator=temporal, also require the reward model to beat a constant out of sample
+# (reward_model_min_skill_z); guards against not-yet-learned single-step reward events
+certify_skill_gate: True
+# Inverse-variance weighted group means (weights 1/s_j^2): best unbiased group estimate when agents'
+# noise levels differ (uses the per-agent estimates in noise-variance-free mode)
+certify_ivw: False
+# Also average each agent's corrected reward over its own neighbouring steps (odd window, e.g. 5;
+# 0 = off), only where predicted rewards are epsilon-close and the temporal rule is certified.
+# Requires a known noise std or certify_noise_estimator=replicates; 9 worked best offline (5 < 9 <~ 13).
+# Large gains for persistent rewards
+certify_temporal_window: 0
+# Fit the proposal reward model on clean rewards during a short warm-up (warmup_iters iterations, e.g. 2)
+certify_warmup: False
 
 # When an exploration wrapper is used. This is its initial epsilon for annealing
 exploration_eps_init: 0.8
@@ -68,10 +162,6 @@ exploration_anneal_frames: null
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
 max_n_frames: 1_500_000
-
-train_grouping_no_warmup: False
-train_grouping_warmup: False
-warmup_iters: 50
 
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 3000
