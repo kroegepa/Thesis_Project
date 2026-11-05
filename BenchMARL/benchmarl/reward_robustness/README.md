@@ -137,15 +137,12 @@ Extensions:
   precise sooner (Pursuit warm start: certified from iteration 6 instead of 10). In
   Pursuit it is not exactly true (RMS consensus bias up to 0.08).
 
-Offline results (Pursuit σ=3.5, within-step SNR pooled over a 20-iteration stream; no
-correction 0.14, spatial oracle 0.54): certified 0.16 → + 2 clean batches 0.43 →
-+ 2 clean batches + temporal window 5 **0.74**. SimpleSpread σ=2.5 (shared-objective SNR;
-none 0.20, oracle 0.42): certified 0.38 → + temporal 0.52.
-
-σ-free with `replicates`: identical to known σ without a warm start. Pursuit 0.16 with
-β 0.96 (temporal estimator: β 0.85), and 0.80 after iteration 13 with temporal window 5.
-SimpleSpread 0.38, and 0.52 with temporal. With a clean warm start, certification waits
-for a precise σ̂² (iteration 10 instead of 1 in Pursuit at σ=3.5).
+Offline results are summarised in [`WRITEUP.md`](../../../WRITEUP.md) at the repository root (§3–4).
+Pursuit σ=3.5, within-step SNR after the cold start:
+- no correction 0.16;
+- σ-free certified + temporal window 9: 0.88;
+- with 2 clean warm-up iterations: 0.97 (known σ) and 1.04 (σ-free, o' key + replicate
+  consensus).
 
 Recommended:
 - `grouping_method=certified grouping_use_next_obs=True grouping_epochs=1
@@ -159,7 +156,9 @@ tolerance of Assumption 1 in reward units. It is also an "erasure budget": event
 rate p and size Δ may be averaged away if p·Δ² ≤ ε².
 
 Logged (`reward_robustness/grouper/*`):
-- `certified_rule` (0 none, 1 `pred`, 2 `pred_in_id`);
+- `certified_rule`: index into (none, `pred`, `pred_in_id`, then `res_pred`, `res_pred_in_id`,
+  `res_id`, `res_all` if `certify_residual`);
+- `temporal_active`, `temporal_delta`, `temporal_margin`, `replicated_frac`;
 - `pred_delta` / `pred_margin` (estimate and z·SE);
 - `identity_clusters`, `noise_var_mean`, `skill_z`;
 - `noise_var_replicates` / `_se`, `noise_replicate_dof` (replicate estimator).
@@ -178,9 +177,16 @@ Logged (`reward_robustness/grouper/*`):
 ## Examples
 
 ```bash
-# Pursuit, 16 pursuers, sigma = 3.5, warm-up-free reward-model grouping with diagnostics
-# (recommended settings from the offline benchmark: o' as input, 1 epoch per iteration,
-#  kernel consensus with epsilon = 0.5, out-of-sample skill gate)
+# Recommended: certified consensus, sigma estimated from replicated transitions, temporal window 9
+python benchmarl/run.py algorithm=mappo task=pettingzoo/pursuit \
+    model=layers/cnn model@critic_model=layers/cnn \
+    experiment.reward_perturbation=True experiment.reward_perturbation_stdev=3.5 \
+    experiment.grouping_method=certified experiment.grouping_use_next_obs=True \
+    experiment.grouping_epochs=1 experiment.certify_temporal_window=9 \
+    experiment.certify_replicate_consensus=True experiment.evaluate_grouping=True
+
+# First-round reward-model grouping (no certification), with diagnostics:
+# o' as input, 1 epoch per iteration, kernel consensus with epsilon = 0.5, out-of-sample skill gate
 python benchmarl/run.py algorithm=mappo task=pettingzoo/pursuit \
     model=layers/cnn model@critic_model=layers/cnn \
     experiment.reward_perturbation=True experiment.reward_perturbation_stdev=3.5 \
@@ -197,7 +203,10 @@ python benchmarl/run.py algorithm=mappo task=pettingzoo/pursuit \
 ```
 
 Offline evaluation of groupers on a recorded training stream:
-`examples/reward_robustness/` (`collect_stream.py`, then `offline_grouping_benchmark.py`).
+`examples/reward_robustness/`.
+1. `collect_stream.py` records the stream.
+2. Replay it with `offline_certified.py` (certified consensus and baselines) or
+   `offline_grouping_benchmark.py` (first-round comparison).
 
 ## Adding a task
 
